@@ -1,0 +1,1 @@
+"""Probe package: cheap go/no-go experiments that run before any heavy compute."""

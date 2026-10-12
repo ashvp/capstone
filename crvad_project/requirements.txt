@@ -1,0 +1,10 @@
+torch>=2.2
+numpy
+scikit-learn
+pyyaml
+# feature extraction / pseudo-labelling (GPU box only)
+transformers>=4.45
+opencv-python-headless
+torchvision
+qwen-vl-utils
+accelerate
