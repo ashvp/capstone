@@ -172,7 +172,7 @@ def iter_frames(path: str):
 
 
 def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
-          max_frames: int = 16, cache: str = "hf_cache", size: int = 224):
+          max_frames: int = 16, cache: str = "hf_cache", videos_per_file: int = 1000):
     import numpy as np
     import pandas as pd
 
@@ -181,36 +181,75 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
 
     tasks = pd.read_parquet(tasks_p)
     frames = pd.read_parquet(data_p)
-    cols = [c for c in ["task_index", "episode_index", "frame_index", "index"] if c in frames.columns]
-    frames = frames[cols].sort_values(["episode_index", "frame_index"])
-    print(f"episodes in file: {frames.episode_index.nunique()}   frames: {len(frames)}   tasks: {len(tasks)}")
 
-    captions = tasks["task"].astype(str).tolist() if "task" in tasks.columns else tasks.iloc[:, -1].astype(str).tolist()
+    print(f"\ntasks.parquet  columns={list(tasks.columns)}  rows={len(tasks)}")
+    print(f"  head:\n{tasks.head(3).to_string()}")
+    print(f"\ndata parquet   columns={list(frames.columns)}  rows={len(frames)}")
+    print(f"  head:\n{frames.head(5).to_string()}")
+
+    # --- column discovery: this mirror's names are not guaranteed -------------
+    def pick(cols, *keywords, exclude=()):
+        for kw in keywords:
+            for c in cols:
+                lc = c.lower()
+                if lc == kw and lc not in exclude:
+                    return c
+        for kw in keywords:
+            for c in cols:
+                lc = c.lower()
+                if kw in lc and lc not in exclude:
+                    return c
+        return None
+
+    task_col = pick(tasks.columns, "task", "text", "caption", "instruction", "description", "language")
+    ep_col = pick(frames.columns, "episode_index", "episode", "episode_id")
+    fidx_col = pick(frames.columns, "frame_index", "frame")
+    tidx_col = pick(frames.columns, "task_index", "task_id", "label")
+    if not all([task_col, ep_col, fidx_col, tidx_col]):
+        raise SystemExit(f"could not resolve columns. tasks={list(tasks.columns)} frames={list(frames.columns)}")
+    print(f"\nresolved: caption={task_col!r} episode={ep_col!r} frame={fidx_col!r} task={tidx_col!r}")
+
+    frames = frames[[ep_col, fidx_col, tidx_col]].sort_values([ep_col, fidx_col])
+    print(f"episodes in this parquet: {frames[ep_col].nunique()}   rows: {len(frames)}")
+
+    # --- the parquet may cover the whole dataset while the mp4 covers only the
+    # first `videos_per_file` episodes. Restrict explicitly rather than decoding
+    # 9.8M frames looking for clips that are not in this file.
+    all_eps = sorted(frames[ep_col].unique())
+    eps_here = all_eps[:videos_per_file]
+    print(f"episodes present in THIS mp4 (first {videos_per_file}): {len(eps_here)}")
+    frames = frames[frames[ep_col].isin(eps_here)]
+
+    captions = tasks[task_col].astype(str).tolist()
+    print(f"distinct captions in tasks.parquet: {len(set(captions))}")
+    print(f"  sample captions: {list(dict.fromkeys(captions))[:5]}")
     matched, missing, _ = resolve_templates(captions)
     print(f"\ntarget templates matched : {len(matched)}/{len(CONTRASTS)}")
     if missing:
         print(f"  NOT FOUND ({len(missing)}): " + "; ".join(missing))
     print("  " + "\n  ".join(matched))
 
-    cap_of_task = {int(t.task_index): _norm(str(t.task)) for t in tasks.itertuples()}
+    cap_of_task = {int(getattr(t, tidx_col)): _norm(str(getattr(t, task_col)))
+               for t in tasks.itertuples()}
     target_norm = {m: _norm(m) for m in matched}
     gid_of_cap = {v: i for i, v in enumerate(target_norm.values())}
+    cap_lookup = {v: m for m, v in target_norm.items()}
 
     # first pass: which episodes to keep, and their frame span
     lab_of_ep: Dict[int, int] = {}
     cap_of_ep: Dict[int, str] = {}
     spans: Dict[int, Tuple[int, int]] = {}
     counts: Dict[int, int] = {}
-    for ep, g in wanted.groupby("episode_index"):
+    for ep, g in frames.groupby(ep_col):
         ep = int(ep)
-        cap = cap_of_task[int(g.task_index.iloc[0])]
+        cap = cap_of_task[int(g[tidx_col].iloc[0])]
         gid = gid_of_cap.get(cap)
         if gid is None or counts.get(gid, 0) >= limit_per_template:
             continue
         counts[gid] = counts.get(gid, 0) + 1
         lab_of_ep[ep] = gid
-        cap_of_ep[ep] = next(m for m, v in target_norm.items() if v == cap)
-        spans[ep] = (int(g.frame_index.min()), int(g.frame_index.max()))
+        cap_of_ep[ep] = cap_lookup[cap]
+        spans[ep] = (int(g[fidx_col].min()), int(g[fidx_col].max()))
 
     if not lab_of_ep:
         raise SystemExit("no matching episodes -- check template strings against this dataset's captions")
@@ -280,8 +319,10 @@ def main():
     ap.add_argument("--limit-per-template", type=int, default=24)
     ap.add_argument("--max-frames", type=int, default=16)
     ap.add_argument("--cache", default="hf_cache")
+    ap.add_argument("--videos-per-file", type=int, default=1000,
+                    help="episodes present in each mp4; the data parquet is dataset-wide")
     a = ap.parse_args()
-    build(a.out, a.chunk, a.file, a.limit_per_template, a.max_frames, a.cache)
+    build(a.out, a.chunk, a.file, a.limit_per_template, a.max_frames, a.cache, a.videos_per_file)
 
 
 if __name__ == "__main__":

@@ -1,2 +1,14 @@
 .venv/
 __pycache__/
+*.py[cod]
+
+# probe / training outputs
+runs/
+data/
+*.pt
+*.pth
+summary.json
+
+# downloaded datasets and model weights (SSv2 chunks, CLIP/EgoVLP weights)
+hf_cache/
+.cache/
