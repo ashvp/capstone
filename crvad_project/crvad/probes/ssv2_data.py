@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -74,35 +76,136 @@ ANTONYM_PAIRS: List[Tuple[str, str]] = [
     ("Putting something underneath something", "Pretending to put something underneath something"),
 ]
 
-# Official SSv2 template ids for the targets above, for the write-up only.
-TEMPLATE_IDS: Dict[str, int] = {
-    "Opening something": 46, "Closing something": 5,
-    "Covering something with something": 6, "Uncovering something": 171,
-    "Folding something": 14, "Unfolding something": 172,
-    "Pouring something into something": 59, "Pouring something out of something": 62,
-    "Moving something up": 45, "Moving something down": 43,
-    "Moving something closer to something": 42, "Moving something away from something": 40,
-    "Moving something towards the camera": 44, "Moving something away from the camera": 41,
-    "Turning the camera upwards while filming something": 168,
-    "Turning the camera downwards while filming something": 165,
-    "Turning the camera right while filming something": 167,
-    "Turning the camera left while filming something": 166,
-    "Taking something from somewhere": 147, "Taking something out of something": 148,
-    "Pretending to take something from somewhere": 81,
-    "Pretending to take something out of something": 82,
-    "Pretending to close something without actually closing it": 66,
-    "Pretending to open something without actually opening it": 67,
-    "Pretending or failing to wipe something off of something": 63,
-    "Picking something up": 47, "Pretending to pick something up": 68,
-    "Throwing something": 151, "Pretending to throw something": 83,
-    "Wiping something off of something": 173,
-    "Turning something upside down": 164, "Pretending to turn something upside down": 84,
-    "Pretending to pour something out of something, but something is empty": 70,
-    "Putting something behind something": 104, "Pretending to put something behind something": 71,
-    "Putting something into something": 106, "Pretending to put something into something": 72,
-    "Putting something next to something": 107, "Pretending to put something next to something": 73,
-    "Putting something underneath something": 118, "Pretending to put something underneath something": 76,
-}
+# The official 174 SSv2 templates, verbatim, with their official ids.
+#
+# Needed because this mirror substitutes object placeholders inconsistently:
+#   "Turning something upside down"                        -> kept as-is
+#   "Turning the camera downwards while filming something"  -> "...while filming guitar"
+# so exact caption matching finds nothing. We instead compile every template into an
+# anchored regex ("something" -> ".+?") and match captions against the FULL 174, then
+# keep the LONGEST matching template. That resolves prefix collisions correctly:
+#   "pouring milk into a cup until it overflows" must hit template 60, not 59,
+#   because 60's regex is longer and therefore more specific.
+OFFICIAL_TEMPLATES: List[str] = [
+    "Approaching something with your camera", "Attaching something to something",
+    "Bending something so that it deforms", "Bending something until it breaks",
+    "Burying something in something", "Closing something",
+    "Covering something with something", "Digging something out of something",
+    "Dropping something behind something", "Dropping something in front of something",
+    "Dropping something into something", "Dropping something next to something",
+    "Dropping something onto something",
+    "Failing to put something into something because something does not fit",
+    "Folding something", "Hitting something with something", "Holding something",
+    "Holding something behind something", "Holding something in front of something",
+    "Holding something next to something", "Holding something over something",
+    "Laying something on the table on its side, not upright",
+    "Letting something roll along a flat surface", "Letting something roll down a slanted surface",
+    "Letting something roll up a slanted surface, so it rolls back down",
+    "Lifting a surface with something on it but not enough for it to slide down",
+    "Lifting a surface with something on it until it starts sliding down",
+    "Lifting something up completely without letting it drop down",
+    "Lifting something up completely, then letting it drop down",
+    "Lifting something with something on it",
+    "Lifting up one end of something without letting it drop down",
+    "Lifting up one end of something, then letting it drop down",
+    "Moving away from something with your camera", "Moving part of something",
+    "Moving something across a surface until it falls down",
+    "Moving something across a surface without it falling down",
+    "Moving something and something away from each other",
+    "Moving something and something closer to each other",
+    "Moving something and something so they collide with each other",
+    "Moving something and something so they pass each other",
+    "Moving something away from something", "Moving something away from the camera",
+    "Moving something closer to something", "Moving something down",
+    "Moving something towards the camera", "Moving something up", "Opening something",
+    "Picking something up", "Piling something up", "Plugging something into something",
+    "Plugging something into something but pulling it right out as you remove your hand",
+    "Poking a hole into some substance", "Poking a hole into something soft",
+    "Poking a stack of something so the stack collapses",
+    "Poking a stack of something without the stack collapsing",
+    "Poking something so it slightly moves",
+    "Poking something so lightly that it doesn't or almost doesn't move",
+    "Poking something so that it falls over", "Poking something so that it spins around",
+    "Pouring something into something", "Pouring something into something until it overflows",
+    "Pouring something onto something", "Pouring something out of something",
+    "Pretending or failing to wipe something off of something",
+    "Pretending or trying and failing to twist something",
+    "Pretending to be tearing something that is not tearable",
+    "Pretending to close something without actually closing it",
+    "Pretending to open something without actually opening it",
+    "Pretending to pick something up", "Pretending to poke something",
+    "Pretending to pour something out of something, but something is empty",
+    "Pretending to put something behind something",
+    "Pretending to put something into something",
+    "Pretending to put something next to something",
+    "Pretending to put something on a surface",
+    "Pretending to put something onto something",
+    "Pretending to put something underneath something",
+    "Pretending to scoop something up with something",
+    "Pretending to spread air onto something", "Pretending to sprinkle air onto something",
+    "Pretending to squeeze something", "Pretending to take something from somewhere",
+    "Pretending to take something out of something", "Pretending to throw something",
+    "Pretending to turn something upside down", "Pulling something from behind of something",
+    "Pulling something from left to right", "Pulling something from right to left",
+    "Pulling something onto something", "Pulling something out of something",
+    "Pulling two ends of something but nothing happens",
+    "Pulling two ends of something so that it gets stretched",
+    "Pulling two ends of something so that it separates into two pieces",
+    "Pushing something from left to right", "Pushing something from right to left",
+    "Pushing something off of something", "Pushing something onto something",
+    "Pushing something so it spins", "Pushing something so that it almost falls off but doesn't",
+    "Pushing something so that it falls off the table", "Pushing something so that it slightly moves",
+    "Pushing something with something", "Putting number of something onto something",
+    "Putting something and something on the table", "Putting something behind something",
+    "Putting something in front of something", "Putting something into something",
+    "Putting something next to something",
+    "Putting something on a flat surface without letting it roll",
+    "Putting something on a surface",
+    "Putting something on the edge of something so it is not supported and falls down",
+    "Putting something onto a slanted surface but it doesn't glide down",
+    "Putting something onto something",
+    "Putting something onto something else that cannot support it so it falls down",
+    "Putting something similar to other things that are already on the table",
+    "Putting something that can't roll onto a slanted surface, so it slides down",
+    "Putting something that can't roll onto a slanted surface, so it stays where it is",
+    "Putting something that cannot actually stand upright upright on the table, so it falls on its side",
+    "Putting something underneath something", "Putting something upright on the table",
+    "Putting something, something and something on the table",
+    "Removing something, revealing something behind", "Rolling something on a flat surface",
+    "Scooping something up with something", "Showing a photo of something to the camera",
+    "Showing something behind something", "Showing something next to something",
+    "Showing something on top of something", "Showing something to the camera",
+    "Showing that something is empty", "Showing that something is inside something",
+    "Something being deflected from something",
+    "Something colliding with something and both are being deflected",
+    "Something colliding with something and both come to a halt",
+    "Something falling like a feather or paper", "Something falling like a rock",
+    "Spilling something behind something", "Spilling something next to something",
+    "Spilling something onto something", "Spinning something so it continues spinning",
+    "Spinning something that quickly stops spinning", "Spreading something onto something",
+    "Sprinkling something onto something", "Squeezing something",
+    "Stacking number of something", "Stuffing something into something",
+    "Taking one of many similar things on the table", "Taking something from somewhere",
+    "Taking something out of something", "Tearing something into two pieces",
+    "Tearing something just a little bit", "Throwing something",
+    "Throwing something against something", "Throwing something in the air and catching it",
+    "Throwing something in the air and letting it fall", "Throwing something onto a surface",
+    "Tilting something with something on it slightly so it doesn't fall down",
+    "Tilting something with something on it until it falls off", "Tipping something over",
+    "Tipping something with something in it over, so something in it falls out",
+    "Touching (without moving) part of something",
+    "Trying but failing to attach something to something because it doesn't stick",
+    "Trying to bend something unbendable so nothing happens",
+    "Trying to pour something into something, but missing so it spills next to it",
+    "Turning something upside down", "Turning the camera downwards while filming something",
+    "Turning the camera left while filming something",
+    "Turning the camera right while filming something",
+    "Turning the camera upwards while filming something",
+    "Twisting (wringing) something wet until water comes out", "Twisting something",
+    "Uncovering something", "Unfolding something", "Wiping something off of something",
+]
+
+TEMPLATE_IDS: Dict[str, int] = {t: i for i, t in enumerate(OFFICIAL_TEMPLATES)}
 
 # Each template -> every template it is contrasted against. A template can have more
 # than one partner ("Closing something" contrasts with both "Opening something" and
@@ -119,28 +222,98 @@ for _a, _b in ANTONYM_PAIRS:
 
 
 def _norm(s: str) -> str:
-    return " ".join(s.strip().lower().split())
+    return " ".join(str(s).strip().lower().split())
 
 
-def resolve_templates(captions: List[str]) -> Tuple[List[str], List[str], List[int]]:
-    """Map target templates onto this dataset's actual caption strings.
+# SSv2 templates do not only use "something" as the object slot. Template 147 is
+# "Taking something from somewhere", template 51 is "Poking a hole into some
+# substance". Treating those as literal text makes their captions unmatchable, so all
+# three forms are treated as wildcards.
+#
+# Known limitation: template 113 ("...onto something else that cannot support it...")
+# drops "else" when its slots are substituted and is therefore not reliably
+# recoverable. It is not used as a contrast target, so it does not affect the gate.
+# NOTE: the group must be NON-capturing. re.split() returns captured groups as extra
+# elements, which injects the literal word "thing" into every generated regex.
+_PLACEHOLDER = re.compile(r"\b(?:something|somewhere|some\s+substance)\b")
 
-    SSv2 keeps the literal word "something" in captions for templates with no real
-    object noun, so these pairs appear verbatim. Anything that does not match is
-    reported rather than silently dropped.
+
+def compile_template(template: str) -> re.Pattern:
+    """'Taking something from somewhere' -> ^taking\\ .+?\\ from\\ .+?$"""
+    parts = _PLACEHOLDER.split(_norm(template))
+    return re.compile("^" + ".+?".join(re.escape(p) for p in parts) + "$")
+
+
+class TemplateMatcher:
+    """Maps a caption back to its SSv2 template, longest match wins.
+
+    Longest-match is what makes this safe: several templates are prefixes of longer
+    ones ("Pouring something into something" vs "...until it overflows"), and the
+    longer regex is always the more specific one.
+
+    A word index avoids running 174 regexes against each of ~124k captions. A caption
+    can only match a template that shares at least one of its fixed (non-"something")
+    words with it, so we only test those candidates.
     """
-    index: Dict[str, str] = {}
-    for c in captions:
-        index.setdefault(_norm(c), c)
 
-    matched, missing = [], []
-    for t in CONTRASTS:
-        if _norm(t) in index:
-            matched.append(t)
-        else:
-            missing.append(t)
-    group_ids = {t: i for i, t in enumerate(sorted(matched))}
-    return sorted(matched), missing, [group_ids[t] for t in sorted(matched)]
+    def __init__(self, templates: List[str] = None):
+        self.templates = list(templates if templates is not None else OFFICIAL_TEMPLATES)
+        self.rx = [compile_template(t) for t in self.templates]
+        self.idx: Dict[str, List[int]] = {}
+        self.always: List[int] = []               # templates with no fixed words
+        for i, t in enumerate(self.templates):
+            fixed = [w for w in _PLACEHOLDER.sub(" ", _norm(t)).split() if len(w) > 2]
+            if not fixed:
+                self.always.append(i)
+            for w in fixed:
+                self.idx.setdefault(w, []).append(i)
+
+    def candidates(self, caption: str) -> List[int]:
+        cap = set(_norm(caption).split())
+        out = set(self.always)
+        for w in cap:
+            if w in self.idx:
+                out.update(self.idx[w])
+        return list(out)
+
+    def match(self, caption: str) -> Optional[int]:
+        """Return the official template id, or None."""
+        c = _norm(caption)
+        best, best_len = None, -1
+        for i in self.candidates(c):
+            if self.rx[i].match(c) and len(self.templates[i]) > best_len:
+                best, best_len = i, len(self.templates[i])
+        return best
+
+    def match_many(self, captions: List[str]) -> Dict[int, int]:
+        """caption position -> template id."""
+        return {i: tid for i, c in enumerate(captions) if (tid := self.match(c)) is not None}
+
+
+def read_captions(tasks) -> List[str]:
+    """This mirror stores captions in the parquet INDEX; the column holds integer ids.
+
+    Handles both layouts: use the index when it is textual, else fall back to the one
+    string-valued column. Raises rather than silently returning integers, which is what
+    made an earlier version of this script match 0/41 targets with no explanation.
+    """
+    index_txt = [_norm(x) for x in tasks.index]
+    if index_txt and any(c and not c.replace(".", "", 1).isdigit() for c in index_txt[:50]):
+        print(f"  captions read from tasks.parquet INDEX ({len(index_txt)} rows)")
+        return index_txt
+
+    for c in tasks.columns:
+        col = tasks[c]
+        if col.dtype == object:
+            vals = [_norm(x) for x in col.head(50)]
+            if any(v and not v.replace(".", "", 1).isdigit() for v in vals):
+                print(f"  captions read from column {c!r}")
+                return [_norm(x) for x in col]
+
+    raise SystemExit(
+        "could not find captions in tasks.parquet. "
+        f"index[:3]={list(tasks.index[:3])} columns={list(tasks.columns)}"
+    )
 
 
 def download(chunk: int, file: int, cache: str) -> Tuple[str, str, str]:
@@ -220,20 +393,60 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
     print(f"episodes present in THIS mp4 (first {videos_per_file}): {len(eps_here)}")
     frames = frames[frames[ep_col].isin(eps_here)]
 
-    captions = tasks[task_col].astype(str).tolist()
-    print(f"distinct captions in tasks.parquet: {len(set(captions))}")
-    print(f"  sample captions: {list(dict.fromkeys(captions))[:5]}")
-    matched, missing, _ = resolve_templates(captions)
-    print(f"\ntarget templates matched : {len(matched)}/{len(CONTRASTS)}")
-    if missing:
-        print(f"  NOT FOUND ({len(missing)}): " + "; ".join(missing))
-    print("  " + "\n  ".join(matched))
+    captions = read_captions(tasks)
+    print(f"distinct captions: {len(set(captions))}")
 
-    cap_of_task = {int(getattr(t, tidx_col)): _norm(str(getattr(t, task_col)))
-               for t in tasks.itertuples()}
-    target_norm = {m: _norm(m) for m in matched}
-    gid_of_cap = {v: i for i, v in enumerate(target_norm.values())}
-    cap_lookup = {v: m for m, v in target_norm.items()}
+    # --- caption -> official template id, longest match wins ------------------
+    matcher = TemplateMatcher()
+    print(f"matching {len(captions)} captions against {len(OFFICIAL_TEMPLATES)} templates ...")
+    cap_of_task: Dict[int, str] = {}
+    tid_of_task: Dict[int, int] = {}
+    unparsed = 0
+    for t in tasks.itertuples():
+        tid = int(getattr(t, tidx_col))
+        cap = captions[tid] if tid < len(captions) else ""
+        cap_of_task[tid] = cap
+        m = matcher.match(cap)
+        if m is None:
+            unparsed += 1
+        else:
+            tid_of_task[tid] = m
+    print(f"  captions matching no template: {unparsed}/{len(captions)} "
+          f"({100*unparsed/max(1,len(captions)):.1f}%) -- this mirror drops some prepositions")
+
+    hit = Counter(tid_of_task.values())
+    matched_set = {OFFICIAL_TEMPLATES[t] for t in hit} & set(CONTRASTS)
+    matched = sorted(matched_set, key=lambda t: TEMPLATE_IDS[t])
+    missing = sorted(set(CONTRASTS) - matched_set)
+    print(f"\ntarget templates present in this dataset: {len(matched)}/{len(CONTRASTS)}")
+    for t in matched:
+        print(f"  [{TEMPLATE_IDS[t]:3d}] {t:52s} {hit[TEMPLATE_IDS[t]]:6d} captions")
+    if missing:
+        print(f"\n  NOT PRESENT ({len(missing)}): " + "; ".join(missing))
+
+    # Verify before trusting: real captions per target, so mis-mappings are visible.
+    print("\n--- VERIFICATION: sample captions per matched target (eyeball these) ---")
+    shown: Counter = Counter()
+    for tid in sorted(tid_of_task.values()):
+        name = OFFICIAL_TEMPLATES[tid]
+        if name not in CONTRASTS or shown[name] >= 3:
+            continue
+        for t2 in tasks.itertuples():
+            k = int(getattr(t2, tidx_col))
+            if tid_of_task.get(k) == tid:
+                print(f"  {name:52s} <- {captions[k]}")
+                shown[name] += 1
+                break
+
+    if len(matched) < 4:
+        raise SystemExit(
+            f"only {len(matched)} target templates found -- too few for a gate. "
+            "Try more --file indices; each mp4 holds only ~1000 of 217838 episodes."
+        )
+
+    # gid = position in `matched`; keys are normalised captions of matched templates
+    gid_of_cap = {_norm(m): i for i, m in enumerate(matched)}
+    cap_lookup = {v: k for k, v in gid_of_cap.items()}
 
     # first pass: which episodes to keep, and their frame span
     lab_of_ep: Dict[int, int] = {}
@@ -242,13 +455,16 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
     counts: Dict[int, int] = {}
     for ep, g in frames.groupby(ep_col):
         ep = int(ep)
-        cap = cap_of_task[int(g[tidx_col].iloc[0])]
-        gid = gid_of_cap.get(cap)
+        tid = tid_of_task.get(int(g[tidx_col].iloc[0]))
+        if tid is None:
+            continue
+        name = OFFICIAL_TEMPLATES[tid]
+        gid = gid_of_cap.get(_norm(name))
         if gid is None or counts.get(gid, 0) >= limit_per_template:
             continue
         counts[gid] = counts.get(gid, 0) + 1
         lab_of_ep[ep] = gid
-        cap_of_ep[ep] = cap_lookup[cap]
+        cap_of_ep[ep] = name
         spans[ep] = (int(g[fidx_col].min()), int(g[fidx_col].max()))
 
     if not lab_of_ep:
