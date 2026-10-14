@@ -20,6 +20,27 @@ from . import slots as S
 CLIP = "openai/clip-vit-base-patch16"
 
 
+def _unwrap(out):
+    """transformers>=5 returns BaseModelOutputWithPooling from get_*_features; older returned a tensor."""
+    for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+        if hasattr(out, attr):
+            return getattr(out, attr)
+    return out
+
+
+def window_starts(n_frames: int, per: int) -> List[int]:
+    """Start index of every window of `per` sampled frames. The last window is right-aligned
+    (overlapping the previous one) so the video tail is always covered -- v1 dropped it, and on
+    surveillance video that is often where the anomaly is. Videos shorter than `per` give one
+    window that the caller pads."""
+    if n_frames <= per:
+        return [0]
+    starts = list(range(0, n_frames - per + 1, per))
+    if starts[-1] + per < n_frames:
+        starts.append(n_frames - per)
+    return starts
+
+
 def _load_clip(dev):
     from transformers import CLIPModel, CLIPProcessor
     m = CLIPModel.from_pretrained(CLIP, torch_dtype=torch.float16).to(dev).eval()
@@ -33,7 +54,7 @@ def build_text_bank(out: str, dev: str = "cuda"):
     embs = []
     for i in range(0, len(sents), 256):
         t = p(text=sents[i:i + 256], return_tensors="pt", padding=True).to(dev)
-        embs.append(torch.nn.functional.normalize(m.get_text_features(**t).float(), dim=-1).cpu())
+        embs.append(torch.nn.functional.normalize(_unwrap(m.get_text_features(**t)).float(), dim=-1).cpu())
     torch.save(torch.cat(embs), out)
 
 
@@ -57,7 +78,7 @@ def _read_frames(path: str, fps_sample: float):
 @torch.no_grad()
 def _encode(m, p, frames: List[torch.Tensor], dev) -> torch.Tensor:
     x = p(images=[f for f in frames], return_tensors="pt", do_rescale=True).pixel_values.to(dev, torch.float16)
-    return torch.nn.functional.normalize(m.get_image_features(pixel_values=x).float(), dim=-1).cpu()
+    return torch.nn.functional.normalize(_unwrap(m.get_image_features(pixel_values=x)).float(), dim=-1).cpu()
 
 
 def extract_windows(paths: List[str], out: str, T: int = 32, seg_frames: int = 8, fps_sample: float = 2.0,
@@ -72,7 +93,7 @@ def extract_windows(paths: List[str], out: str, T: int = 32, seg_frames: int = 8
             continue
         fr = _read_frames(path, fps_sample)
         per = T * seg_frames
-        for w0 in range(0, max(1, len(fr) - per + 1), per):
+        for w0 in window_starts(len(fr), per):
             win = fr[w0:w0 + per]
             if len(win) < per:                       # pad the tail by repeating the last frame
                 win = win + [win[-1]] * (per - len(win))

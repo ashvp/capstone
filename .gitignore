@@ -9,6 +9,17 @@ data/
 *.pth
 summary.json
 
-# downloaded datasets and model weights (SSv2 chunks, CLIP/EgoVLP weights)
+# downloaded datasets and model weights (SSv2 chunks, CLIP/EgoVLP/ViCLIP weights)
 hf_cache/
 .cache/
+
+# hand-off archives (superseded by the repo itself)
+capstone_crvad.zip
+
+# NOTE on large artefacts. These are gitignored but are REQUIRED to reproduce the
+# probes, and cannot be regenerated on a GPU instance without the download step:
+#   runs/ssv2_pairs.pt   ~606 MB  264 clips x 16 frames x 3x224x224 uint8
+#   hf_cache/            ~872 MB  ViCLIP-B-16-hf snapshot (599 MB) + SSv2 shards
+# To run on a remote GPU, either upload these separately (Kaggle dataset / Drive /
+# scp) or rebuild them there: tools/fetch_viclip.py + ssv2_data.py take ~5 min each.
+# Do NOT try to commit them -- 1.5 GB of binaries in git history is unmergeable.

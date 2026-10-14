@@ -4,7 +4,7 @@ seed: 0
 val_frac: 0.1                       # validation split carved from the TRAINING source (never a test benchmark)
 out: runs/default
 device: auto
-amp: true                           # bf16 autocast on A40 (Ampere)
+amp: false                          # heads are tiny; fp32 is fine. bf16 needs Ampere (A40 ok, T4 not)
 workers: 4
 
 model:

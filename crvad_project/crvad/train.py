@@ -74,7 +74,7 @@ def loss_stage2(model, text_emb, b, c):
     scores = model.posterior_scores(seg, text_emb)
     mil, _ = mil_loss(scores, b["video_label"], c["k_frac"])
     loss, logs = mil, dict(mil=mil.item())
-    valid = b["slots"][:, 0] >= 0
+    valid = (b["slots"] >= 0).all(dim=1)          # a -1 in ANY slot would wrap to a wrong hypothesis
     if valid.any() and c["lam_nce"] > 0:
         sl = b["slots"][valid]
         pos = flat_index(sl)
@@ -127,6 +127,10 @@ def run(cfg: dict, stage: int) -> str:
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
     use_amp = cfg["amp"] and dev.type == "cuda"
+    if use_amp and not torch.cuda.is_bf16_supported():
+        # T4 (Turing) has no bf16 and the heads are tiny: fp32 is simpler and safe.
+        print("[warn] bf16 unsupported on this GPU; running in fp32 (amp disabled)")
+        use_amp = False
     out_dir = os.path.join(cfg["out"], f"stage{stage}")
     os.makedirs(out_dir, exist_ok=True)
     step_fn = loss_stage1 if stage == 1 else loss_stage2

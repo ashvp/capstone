@@ -89,15 +89,18 @@ def evaluate(model: CRVADModel, text_bank: torch.Tensor, videos: Optional[dict] 
     if pairs is not None:
         s0 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["feats0"]), k_frac)
         s1 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["feats1"]), k_frac)
-        n0 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis0"]), k_frac)
-        n1 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis1"]), k_frac)
+        has_nuis = "nuis0" in pairs and "nuis1" in pairs
+        if has_nuis:
+            n0 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis0"]), k_frac)
+            n1 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis1"]), k_frac)
         held = pairs["heldout"].bool()
         for name, m in {"all": torch.ones_like(held), "seen": ~held, "heldout": held}.items():
             if not m.any():
                 continue
             r = {"flip_acc": float((s1[m] > s0[m]).float().mean()),
-                 "flip_acc_nuis": float((n1[m] > n0[m]).float().mean()),
                  "score_gap": float((s1[m] - s0[m]).mean())}
+            if has_nuis:
+                r["flip_acc_nuis"] = float((n1[m] > n0[m]).float().mean())
             feats = torch.cat([pairs["feats0"][m], pairs["feats1"][m]])
             slots = torch.cat([pairs["slots0"][m], pairs["slots1"][m]])
             overall, per = edit_accuracy(model, text_emb, feats, slots)

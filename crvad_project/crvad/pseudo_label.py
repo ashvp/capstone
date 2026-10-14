@@ -33,12 +33,17 @@ def build_prompt() -> str:
 
 def parse_response(text: str) -> Optional[Dict[str, Optional[int]]]:
     """Extract the first JSON object and map values to schema indices (None for unknown / invalid)."""
-    m = re.search(r"\{.*?\}", text, flags=re.S)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    obj = None
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text):               # first brace that starts a valid JSON object
+        try:
+            cand, _ = dec.raw_decode(text[m.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(cand, dict) and any(k in cand for k in S.SLOT_NAMES):   # skip unrelated JSON objects
+            obj = cand
+            break
+    if obj is None:
         return None
     out: Dict[str, Optional[int]] = {}
     for name in S.SLOT_NAMES:
@@ -96,10 +101,14 @@ class QwenVLBackend:
         text = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         images, videos = process_vision_info(msgs)
         inp = self.processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt").to(self.model.device)
-        out = self.model.generate(**inp, do_sample=True, temperature=self.temperature, max_new_tokens=self.max_new_tokens,
-                                  num_return_sequences=n)
-        out = out[:, inp.input_ids.shape[1]:]
-        return self.processor.batch_decode(out, skip_special_tokens=True)
+        # n independent sampled generations in a loop: num_return_sequences>1 with video inputs has
+        # been buggy in some transformers versions and returns near-duplicate captions.
+        texts = []
+        for _ in range(n):
+            out = self.model.generate(**inp, do_sample=True, temperature=self.temperature,
+                                      max_new_tokens=self.max_new_tokens)
+            texts += self.processor.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)
+        return texts
 
 
 def run(backend, items: List[dict], n_samples: int = 3) -> List[dict]:

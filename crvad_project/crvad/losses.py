@@ -17,6 +17,8 @@ _MULT = None
 
 def flat_index(slot_tuples: torch.Tensor) -> torch.Tensor:
     """(...,4) slot indices -> (...) flat hypothesis index (matches slots.encode)."""
+    if (slot_tuples < 0).any():
+        raise ValueError("negative slot index (-1 = unknown) reached flat_index; filter such rows first")
     mult = torch.tensor([S.RADIX[1] * S.RADIX[2] * S.RADIX[3], S.RADIX[2] * S.RADIX[3], S.RADIX[3], 1],
                         device=slot_tuples.device)
     return (slot_tuples * mult).sum(-1)
