@@ -1,10 +1,30 @@
+# Python >= 3.10 required. Python 3.7/3.8 cannot resolve torch>=2.2 (max 1.13.1),
+# and transformers>=5 needs >= 3.9. Create a fresh env; do not reuse an older VAD/TAO env.
+
 torch>=2.2
 numpy
 scikit-learn
 pyyaml
+
+# SSv2 data prep. polars replaces pyarrow, which Windows AppLoader blocks
+# (ImportError: DLL load failed) -- torch's own DLLs load fine, so the block is
+# targeted rather than blanket. av decodes the AV1 video in the LeRobot mirror;
+# OpenCV cannot open it.
+polars>=2.0.0
+av>=19.0.0
+
 # feature extraction / pseudo-labelling (GPU box only)
 transformers>=4.45
-opencv-python-headless
 torchvision
-qwen-vl-utils
 accelerate
+
+# ViCLIP. Not pip-installable (no package) -- fetch the snapshot with
+#   python tools/fetch_viclip.py
+# but it needs these at import time:
+timm==0.6.13        # newer timm dropped timm.models.registry / timm.models.layers
+einops>=0.8
+ftfy>=6.0          # used by CLIP's simple_tokenizer
+regex
+
+# optional: EgoVLPv2 (not installable; clone + pip install -e, set EGOVLP_REPO)
+# qwen-vl-utils, opencv-python-headless  -- only for the Stage-2 VLM pseudo-labeller
