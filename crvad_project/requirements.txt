@@ -29,6 +29,10 @@ timm==0.6.13        # newer timm dropped timm.models.registry / timm.models.laye
 einops>=0.8
 ftfy>=6.0          # used by CLIP's simple_tokenizer
 regex
+setuptools>=70     # viclip_text.py does `from pkg_resources import packaging`; setuptools is
+                    # no longer a default install on py3.12+, so it goes missing there and the
+                    # import fails with a bare ModuleNotFoundError naming pkg_resources, which
+                    # gives no hint that setuptools is the thing to install
 
 # optional: EgoVLPv2 (not installable; clone + pip install -e, set EGOVLP_REPO)
 # qwen-vl-utils, opencv-python-headless  -- only for the Stage-2 VLM pseudo-labeller
