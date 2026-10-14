@@ -31,7 +31,7 @@ from typing import Dict, List
 import torch
 
 from .relation_probe import probe_macro, variants
-from .ssv2_data import ANTONYM_PAIRS
+from .ssv2_data import ANTONYM_PAIRS, pair_kind
 
 CACHE = "runs/feats"
 
@@ -100,7 +100,8 @@ def pair_feature_sets(X: torch.Tensor, labels: torch.Tensor, captions) -> List[D
     out = []
     for a, b in ANTONYM_PAIRS:
         if a in gid and b in gid:
-            out.append({"name": f"{a} vs {b}", "A": X[labels == gid[a]], "B": X[labels == gid[b]]})
+            out.append({"name": f"{a} vs {b}", "kind": pair_kind(a, b),
+                        "A": X[labels == gid[a]], "B": X[labels == gid[b]]})
     return out
 
 
@@ -153,12 +154,25 @@ def main():
                   f"({'ORDER-SENSITIVE' if m < 0.999 else 'ORDER-BLIND -> order-aware scores are appearance'})")
             results[enc]["_order_sensitivity_cosine"] = m
         for name, X in vs.items():
-            r = probe_macro(pair_feature_sets(X, labels, captions), n_perm=a.n_perm)
+            pfs = pair_feature_sets(X, labels, captions)
+            r = probe_macro(pfs, n_perm=a.n_perm)
             results[enc][name] = r
             if r.get("n_pairs", 0):
                 sig = "  <-- SIGNIFICANT" if r["p_value"] < 0.05 else ""
                 print(f"  {name:12s} macro AUC {r['macro_auc']:.3f}  null {r['null_mean']:.3f} "
                       f"(p95 {r['null_p95']:.3f})  p={r['p_value']:.3f}  ({r['n_pairs']} pairs){sig}")
+                # Split by WHY the pair is hard. Each group gets its OWN null, because the
+                # two have different pair counts and therefore different noise floors.
+                for kind in ("directional", "pretend"):
+                    sub = probe_macro([p for p in pfs if p["kind"] == kind], n_perm=a.n_perm)
+                    results[enc][f"{name}[{kind}]"] = sub
+                    if sub.get("n_pairs", 0):
+                        k = "  <-- SIGNAL" if sub["p_value"] < 0.05 else ""
+                        print(f"    {kind:12s} AUC {sub['macro_auc']:.3f}  null {sub['null_mean']:.3f} "
+                              f"(p95 {sub['null_p95']:.3f})  p={sub['p_value']:.3f} "
+                              f"({sub['n_pairs']} pairs){k}")
+                    else:
+                        print(f"    {kind:12s} no usable pairs (need >=3 clips per template)")
             else:
                 print(f"  {name:12s} no usable pairs (need >=3 clips per template)")
         print()

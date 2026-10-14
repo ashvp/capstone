@@ -3,8 +3,12 @@
 Companion to `PLAN.md`. That document is the *plan*; this one records **what was actually
 built, run, and measured**, including the things that failed.
 
-Last updated: 13 October 2026
-Status: Gate 1 passed Â· Gate 2 **inconclusive / measurement-limited**
+Last updated: 14 October 2026
+Status: Gate 1 passed (on a placeholder schema) Â· Gate 2 **negative across 3 encoders Ã— 2 machines**
+
+> **Read Â§9 before using any number in Â§2.** Sections 2â€“8 record the first Gate-2 run and
+> its bugs. Every Gate-2 figure in them is **void** â€” the cached features were degenerate.
+> Â§9 supersedes them.
 
 ---
 
@@ -282,3 +286,147 @@ set*, returning a probability distribution instead of generating tokens.
 should be framed as a **transfer of that recipe to VAD**, not as an invented
 architecture. CLM is text-only and encoder-locked to Qwen3-8B embeddings; a multimodal
 CLM-35B was announced for "early October" and had not shipped as of 12 Oct 2026.
+---
+
+## 9. Gate 2 v2 — the first run was invalid, and the corrected result is negative
+
+Appended 14 Oct 2026. This section supersedes the Gate-2 numbers in §2.
+
+### 9.1 Why every earlier Gate-2 number is void
+
+The v1 feature caches were degenerate. Measured on the cached tensors:
+
+| | v1 cache | healthy |
+|---|---|---|
+| fraction of entries > 0 | **0.968** (CLIP) / 0.521 (X-CLIP) | ~0.5 |
+| mean pairwise cosine between clips | **0.955** (CLIP) / 0.844 (X-CLIP) | ~0.6–0.7 |
+
+Mean pairwise cosine 0.955 means every clip was ~95% identical to every other clip. Three
+independent bugs produced that:
+
+1. **Per-dimension MAX over frames.** v1 did `feat.view(b,f,-1).max(dim=1).values` over 16
+   independently-normalised frame vectors, driving ~97% of coordinates positive and
+   inflating all inter-clip cosine toward 1.
+2. **`clamp(0,1)` applied AFTER normalisation**, zeroing roughly half of CLIP's pixels.
+3. **X-CLIP was never normalised at all.** `NORM["xclip"]` was defined and never called.
+
+Separately, the pooled `edit_acc` metric was **not imbalance-invariant**: a classifier that
+ignores the video and always prefers the larger template scores `n_A/(n_A+n_B)`, and on these
+pair sizes that range is **0.360–0.640**. CLIP's reported 0.622 sat *inside* it.
+`tools/audit_gate2_json.py` reproduces this on the archived v1 json.
+
+The corrected CLIP number is 0.531 — mid-band, i.e. chance.
+
+### 9.2 Corrected zero-shot bakeoff (v2, mean pooling, proper normalisation)
+
+Two machines, same code: local CPU on 264 clips, remote A40 on 275 clips. (The clip-count
+difference comes from the AV1 decode boundary — `av` 14 on py3.11 vs `av` 19 on py3.12 — and
+means the two runs are not strictly comparable; see §9.5.)
+
+| encoder | macro AUC | 95% CI | perm p | balanced acc | video-blind pairs |
+|---|---|---|---|---|---|
+| CLIP (A40) | 0.524 | [0.451, 0.597] | 0.287 | 0.501 | 19/22 |
+| X-CLIP (A40) | 0.570 | [0.500, 0.636] | 0.053 | 0.539 | 8/22 |
+
+"video-blind pairs" counts pairs where the number correct exactly equals one class's clip
+count — the signature of a classifier that never looks at the video.
+
+The v1 ranking (CLIP > X-CLIP) was **backwards for two reasons**, both v1 bugs: CLIP's was
+inflated by max-pooling, X-CLIP's depressed by having no normalisation. Fixed both and X-CLIP
+leads on the bias-invariant metric, though p=0.053 is not significant.
+
+### 9.3 Relation probe — null on every encoder, every variant
+
+Standardised ridge with exact-LOO ?, binary per-pair, scored by macro AUC against a
+within-pair label-permutation null (200 permutations). A p-value here is the fraction of
+shuffled-label runs that matched or beat the observed score — so 0.318 means "a third of
+noise runs beat you", and 0.861 means "most of them did".
+
+**A40, 275 clips:**
+
+| encoder | variant | macro AUC | null | p95 | p |
+|---|---|---|---|---|---|
+| clip | mean | 0.472 | 0.496 | 0.580 | 0.667 |
+| clip | halves | 0.481 | 0.491 | 0.578 | 0.547 |
+| clip | delta | 0.484 | 0.491 | 0.578 | 0.507 |
+| clip | halves_shuf | 0.492 | 0.491 | 0.569 | 0.498 |
+| xclip | vmean | 0.525 | 0.499 | 0.581 | 0.318 |
+| xclip | vhalves | 0.458 | 0.493 | 0.576 | 0.731 |
+| xclip | vdelta | 0.451 | 0.498 | 0.587 | 0.806 |
+| xclip | vshuf | 0.527 | 0.500 | 0.584 | 0.308 |
+| viclip | vmean | 0.438 | 0.492 | 0.571 | 0.861 |
+| viclip | vhalves | 0.453 | 0.496 | 0.576 | 0.816 |
+| viclip | vdelta | 0.448 | 0.497 | 0.592 | 0.871 |
+| viclip | vshuf | 0.455 | 0.498 | 0.576 | 0.786 |
+
+**CPU, 264 clips** — CLIP replicates as null on all four variants (mean 0.490 p=0.498,
+halves 0.443 p=0.821, delta 0.451 p=0.746, halves_shuf 0.530 p=0.219). X-CLIP on CPU gave
+mean AUC 0.588, **p=0.045**, which looked significant; **it did not replicate on the A40**
+(0.525, p=0.318). Treated as noise and retracted.
+
+### 9.4 Order sensitivity — the substantive finding
+
+X-CLIP and ViCLIP collapse frames *inside* the encoder, so no frame axis survives in the
+output and the usual `mean`/`halves`/`delta` split cannot be computed for them. Built at the
+encoder *input* instead: encode the first half and second half separately, and measure
+`cosine(identity, shuffled)` where identity and shuffled see the same frame set at the same
+arity, differing only in order.
+
+| encoder | cosine(identity, shuffled) | reading |
+|---|---|---|
+| xclip | **0.9986** | ~3° of movement — effectively order-**blind** |
+| viclip | **0.9636** | ~15° — genuinely more order-responsive than X-CLIP |
+
+So spatiotemporal attention does buy *some* order responsiveness, but neither encoder uses
+frame order enough to support minimal-pair discrimination: `vhalves` is no better than
+`vmean` on either, and `vshuf` ˜ `vmean` confirms it from the other side. This is the direct
+answer to "video pretraining buys nothing here" — it buys a little order sensitivity and no
+usable relation signal.
+
+Note: this also explains why `vhalves` underperformed `vmean` on X-CLIP (0.458 vs 0.525).
+Concatenating two halves doubles the feature dimension for the probe with no added signal, so
+it can only add variance.
+
+### 9.5 Unresolved: the X-CLIP CPU/GPU discrepancy
+
+Same metric, same code, 264 vs 275 clips, macro AUC 0.588 (p=0.045) vs 0.525 (p=0.318). An
+11-clip difference should not move an AUC by 0.063. Most likely the AV1 decode boundary
+(`av` 14 on py3.11 vs 19 on py3.12) selecting different frames, but **this is unverified**.
+Until it is explained, treat single-run p-values from this pipeline as provisional — it is
+the difference between measuring something and measuring noise.
+
+### 9.6 What this does and does not establish
+
+**Established:** on 264–275 clips, none of CLIP / X-CLIP / ViCLIP separates SSv2 minimal
+intervention pairs above its own permutation null, on any pooled, per-frame, or order-aware
+probe, on two machines. Video pretraining does not help at this scale.
+
+**Not established:** that the information is absent. Every null has p95 ˜ 0.57–0.59 — that
+is the noise floor at 19 pairs and ~5 clips per template, and it means a real effect of AUC
+~0.55 would be invisible. The probe has low *power*, not just a null result.
+
+**Also note:** Gate 1's AUC 0.979 was measured on `slots.SCHEMA`, which is explicitly a
+PLACEHOLDER (`takes/places/carries… × bag/bottle/box… × store/street… × from a shelf/…`),
+not on SSv2 and not on surveillance. It remains a valid statement about the text encoder's
+behaviour, but it is not evidence for the real task, and Stage 1 currently has no real slot
+labels to train on at all.
+
+### 9.7 Next
+
+| # | Action | Cost | Why |
+|---|---|---|---|
+| 1 | Split directional vs pretend pairs (§ `pair_kind`) | seconds | If the weak signal was object/scene appearance leak rather than relation, this shows it. **Done — see §9.8.** |
+| 2 | 5-shard build via `ssv2_multi.py` ? ~1,300 clips | ~20 min A40 | The only fix for the power problem; every null here sits at p95 ˜ 0.58 |
+| 3 | Define the real surveillance schema | — | Stage 1 cannot train without real slot labels, independent of encoder choice |
+| 4 | UCF-Crime zero-shot probe | ~minutes | Does CLIP transfer to surveillance at all; no slot labels needed |
+
+### 9.8 Directional vs pretend split
+
+The 22 pairs are not one population. 9 are **directional** (opening/closing, up/down,
+into/out of, camera left/right) — these differ only in temporal ORDER, so a pooled
+order-blind representation cannot separate them in principle, and any score above 0.5 there
+indicates an appearance difference between the two templates rather than the relation. The
+other 13 are **pretend** (performed vs mimed). Conflating them hides which failure mode is
+happening, so each group is now scored against its own permutation null.
+
+Result: [pending — see `runs/gate2_split_*.json`].

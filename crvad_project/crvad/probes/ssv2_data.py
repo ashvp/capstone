@@ -58,6 +58,41 @@ REPO = "n3puiol/something_something_v2_lerobot"
 #   (b) "Pretending or failing to..." -- looks like the action, isn't performed.
 #       This is the tightest test of the thesis: the ONLY difference is whether the
 #       relation actually happens, with no change of object, scene or camera.
+# Split the pairs by WHY they are hard, because they can fail for different reasons.
+#
+#   "directional" the two templates are the same action in opposite DIRECTIONS
+#       (opening/closing, up/down, into/out of, camera left/right). The only difference is
+#       temporal ORDER. A pooled, order-blind representation CANNOT separate these in
+#       principle -- so if an order-blind score comes out above 0.5, the probe is not
+#       reading order, it is reading an appearance difference between the two templates
+#       (different objects or scenes get sampled for them). That is the leak the v2
+#       relation_probe docstring warns about.
+#
+#   "pretend"     the same action, performed vs mimed. Object, scene and camera are
+#       plausibly shared, so these are not order-defined in the same way -- but a strong
+#       score here is also suspicious, because SSv2 does not guarantee matched objects.
+#
+# Conflating them hides which of the two failure modes is happening.
+DIRECTIONAL_PAIRS: List[Tuple[str, str]] = [
+    ("Opening something", "Closing something"),
+    ("Covering something with something", "Uncovering something"),
+    ("Folding something", "Unfolding something"),
+    ("Pouring something into something", "Pouring something out of something"),
+    ("Moving something up", "Moving something down"),
+    ("Moving something closer to something", "Moving something away from something"),
+    ("Moving something towards the camera", "Moving something away from the camera"),
+    ("Turning the camera upwards while filming something",
+     "Turning the camera downwards while filming something"),
+    ("Turning the camera right while filming something",
+     "Turning the camera left while filming something"),
+]
+
+
+def pair_kind(a: str, b: str) -> str:
+    """'directional' if the pair differs only by direction/order, else 'pretend'."""
+    return "directional" if (a, b) in {(x, y) for x, y in DIRECTIONAL_PAIRS} else "pretend"
+
+
 ANTONYM_PAIRS: List[Tuple[str, str]] = [
     # (a) antonymy
     ("Opening something", "Closing something"),
