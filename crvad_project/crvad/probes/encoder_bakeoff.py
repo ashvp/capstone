@@ -122,6 +122,34 @@ def encode_frames(name: str, clips: torch.Tensor, dev: str, batch: int = 32) -> 
 
 
 # --------------------------------------------------------------------------- viclip
+def _shim_pkg_resources() -> None:
+    """Make `from pkg_resources import packaging` work on setuptools >= 81.
+
+    viclip_text.py:4 imports pkg_resources solely for
+        packaging.version.parse(torch.__version__) < packaging.version.parse("1.8.0")
+    -- a torch-1.8 compat check that is dead code on any modern torch. setuptools 81+
+    dropped pkg_resources, so the ViCLIP import dies with
+        ModuleNotFoundError: No module named 'pkg_resources'
+    which names pkg_resources rather than setuptools and so does not suggest a fix.
+
+    Installing/downgrading setuptools would also work but pins an unrelated build tool to a
+    version range for the sake of one dead comparison. `packaging` is a standalone package
+    that provides exactly what is used here, so alias it instead.
+    """
+    import sys
+    try:
+        import pkg_resources  # noqa: F401
+        return
+    except ImportError:
+        pass
+    import types
+    import packaging
+    import packaging.version          # submodule: not auto-imported as an attribute
+    mod = types.ModuleType("pkg_resources")
+    mod.packaging = packaging         # what viclip_text.py actually reaches for
+    sys.modules["pkg_resources"] = mod
+
+
 def _load_viclip(dev: str):
     """ViCLIP-B-16 (InternVid, arXiv:2307.06942). No pip package; fetch with
     `python tools/fetch_viclip.py`, then load from the local snapshot via trust_remote_code.
@@ -151,6 +179,8 @@ def _load_viclip(dev: str):
 
     if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
         PreTrainedModel.all_tied_weights_keys = {}
+
+    _shim_pkg_resources()
 
     if not os.path.isdir(VICLIP_DIR):
         raise RuntimeError(
