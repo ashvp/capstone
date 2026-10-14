@@ -77,17 +77,65 @@ def normalise(x: torch.Tensor, name: str) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- encoders
-def encode_frames(name: str, clips: torch.Tensor, dev: str, batch: int = 32) -> torch.Tensor:
+def _select(clips: torch.Tensor, frames, dev: str, native: int = 8) -> torch.Tensor:
+    """Slice a frame subset out of (N,F,3,H,W) uint8, resampled to the encoder's arity.
+
+    `native` is how many frames the ENCODER consumes (8 for X-CLIP and ViCLIP), which is
+    generally fewer than the clip has. Passing the clip length instead would hand an
+    8-frame model a 16-frame tensor: ViCLIP's temporal_positional_embedding is
+    (1, 8, width) and is broadcast, not validated, so that fails silently rather than loudly.
+
+    `frames` is one of:
+      None        the encoder's own uniform sampling over the whole clip (default)
+      "first"     the first half of the clip
+      "last"      the second half -- what makes a halves probe order-aware for the
+                  video-native encoders, whose temporal transformer collapses frames
+                  INSIDE the encoder, leaving no frame axis in the output to split
+      "shuffled"  the same frames in random order, subsampled to the same arity. An
+                  order-sensitive encoder must give a DIFFERENT embedding here; if it does
+                  not, it is ignoring frame order and any order-aware score is appearance.
+    """
+    f = clips.shape[1]
+    k = min(native, f)
+    # The identity selection: uniform subsample of the whole clip down to the encoder's
+    # arity. Every other mode is defined relative to THIS, so 'shuffled' is a permutation
+    # of exactly these frames -- same content, same count, different order. Sampling a
+    # different subset would confound order with content and the control would prove nothing.
+    base = torch.linspace(0, f - 1, k).round().long()
+    if frames is None:
+        sel = base
+    elif frames in ("first", "last"):
+        h = max(1, f // 2)
+        lo, hi = (0, h) if frames == "first" else (h, min(2 * h, f))
+        idx = torch.arange(lo, hi)
+        sel = idx[torch.linspace(0, len(idx) - 1, k).round().long()]
+    elif frames == "shuffled":
+        g = torch.Generator().manual_seed(0)
+        sel = base[torch.randperm(k, generator=g)]
+    else:
+        raise ValueError(f"frames={frames!r} not one of None/first/last/shuffled")
+    return clips[:, sel.to(clips.device)]
+
+
+def encode_frames(name: str, clips: torch.Tensor, dev: str, batch: int = 32,
+                  frames=None) -> torch.Tensor:
     """(N,F,3,H,W) uint8 -> (N,T,D) L2-normalised. CLIP: one vector per frame (T=F).
-    X-CLIP / EgoVLP: one video-level vector (T=1)."""
+    X-CLIP / ViCLIP / EgoVLP: one video-level vector (T=1), because their temporal
+    modelling happens inside the encoder.
+
+    `frames` (see _select) restricts the input frame subset, which is how the halves and
+    shuffle controls are built for the T=1 encoders.
+    """
     if name == "clip":
         from transformers import AutoModel
 
+        # CLIP is a per-frame image tower: native == every frame in the clip.
+        sub = _select(clips, frames, dev, native=clips.shape[1])
         model = AutoModel.from_pretrained(HF_IDS[name], torch_dtype=torch.float32).to(dev).eval()
         outs = []
         with torch.no_grad():
-            for i in range(0, len(clips), batch):
-                x = normalise(_prep(clips[i : i + batch], dev), "clip")
+            for i in range(0, len(sub), batch):
+                x = normalise(_prep(sub[i : i + batch], dev), "clip")
                 b, f = x.shape[:2]
                 feat = F.normalize(_unwrap(model.get_image_features(pixel_values=x.flatten(0, 1))).float(), dim=-1)
                 outs.append(feat.view(b, f, -1).cpu())
@@ -99,13 +147,15 @@ def encode_frames(name: str, clips: torch.Tensor, dev: str, batch: int = 32) -> 
     if name == "xclip":
         from transformers import AutoModel
 
+        # Always go through _select, including frames=None: the order-sensitivity control
+        # compares identity against shuffled, and if those two paths pick frames differently
+        # (all 16 vs a subsampled 8) the control measures the frame COUNT, not the order.
+        sub = _select(clips, frames, dev, native=XCLIP_FRAMES)
         model = AutoModel.from_pretrained(HF_IDS[name], torch_dtype=torch.float32).to(dev).eval()
-        k = min(XCLIP_FRAMES, clips.shape[1])
-        sel = torch.linspace(0, clips.shape[1] - 1, k).round().long()
         outs = []
         with torch.no_grad():
-            for i in range(0, len(clips), batch):
-                x = normalise(_prep(clips[i : i + batch][:, sel], dev), "xclip")   # <- v1 skipped this
+            for i in range(0, len(sub), batch):
+                x = normalise(_prep(sub[i : i + batch], dev), "xclip")   # <- v1 skipped this
                 outs.append(F.normalize(_unwrap(model.get_video_features(pixel_values=x)).float(), dim=-1).cpu())
         del model
         if dev.startswith("cuda"):
@@ -113,7 +163,7 @@ def encode_frames(name: str, clips: torch.Tensor, dev: str, batch: int = 32) -> 
         return torch.cat(outs).unsqueeze(1)
 
     if name == "viclip":
-        return _encode_viclip(clips, dev, batch)
+        return _encode_viclip(clips, dev, batch, frames)
 
     if name in EGOVLP:
         return _encode_egovlp(clips, dev, batch).cpu().unsqueeze(1)
@@ -205,19 +255,19 @@ def _load_viclip(dev: str):
     return m
 
 
-def _encode_viclip(clips: torch.Tensor, dev: str, batch: int) -> torch.Tensor:
+def _encode_viclip(clips: torch.Tensor, dev: str, batch: int, frames=None) -> torch.Tensor:
     """(N,F,3,H,W) -> (N,1,D). One pooled vector per clip: ViCLIP's spatiotemporal attention
     already integrates the frames, so there is nothing to keep per-frame (T=1)."""
     m = _load_viclip(dev)
     # temporal_positional_embedding is (1, num_frames, width) and is BROADCAST, never checked,
-    # so the wrong frame count either errors or silently reuses one frame. Resample to exactly
-    # what the checkpoint was built with.
-    t = m.video_input_num_frames
-    sel = torch.linspace(0, clips.shape[1] - 1, t).round().long()
+    # so the wrong frame count either errors or silently reuses one frame. _select always
+    # resamples to the checkpoint's own arity, and is used for frames=None too so that the
+    # identity and shuffled passes see the same number of frames.
+    sub = _select(clips, frames, dev, native=m.video_input_num_frames)
     outs = []
     with torch.no_grad():
-        for i in range(0, len(clips), batch):
-            x = normalise(_prep(clips[i : i + batch][:, sel], dev), "viclip")   # never clamp
+        for i in range(0, len(sub), batch):
+            x = normalise(_prep(sub[i : i + batch], dev), "viclip")   # never clamp
             # encode_vision permutes (B,T,C,H,W) -> (B,C,T,H,W) for the 3D conv and returns a
             # single pooled (B,512); the docstring's promised tuple is not what the code returns.
             outs.append(F.normalize(m.encode_vision(x, test=True).float(), dim=-1).cpu())

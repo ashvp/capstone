@@ -36,23 +36,63 @@ from .ssv2_data import ANTONYM_PAIRS
 CACHE = "runs/feats"
 
 
-def get_frame_feats(encoder: str, data, dev: str, batch: int = 32) -> torch.Tensor:
+def get_frame_feats(encoder: str, data, dev: str, batch: int = 32, frames=None) -> torch.Tensor:
     """(N,T,D) per-frame features, cached. The cache stores the labels it was built for and is
-    discarded if they differ (a stale cache silently attached to new labels is a classic bug)."""
+    discarded if they differ (a stale cache silently attached to new labels is a classic bug).
+
+    `frames` (see encoder_bakeoff._select) selects a frame SUBSET; it is part of the cache key
+    because first8 / last8 / shuffled are three different feature sets and reusing one for
+    another would silently destroy the order comparison this probe exists to make.
+    """
     os.makedirs(CACHE, exist_ok=True)
-    path = os.path.join(CACHE, f"{encoder}_frames_{data['clips'].shape[0]}x{data['clips'].shape[1]}.pt")
+    tag = f"{encoder}_{frames or 'all'}_frames_{data['clips'].shape[0]}x{data['clips'].shape[1]}"
+    path = os.path.join(CACHE, f"{tag}.pt")
     if os.path.exists(path):
         c = torch.load(path, weights_only=True)
         if torch.equal(c["label"], data["label"]):
-            print(f"  [{encoder}] cached {path}")
+            print(f"  [{encoder}/{frames or 'all'}] cached")
             return c["F"].float()
         print(f"  [{encoder}] cache labels differ from data -> re-encoding")
     from .encoder_bakeoff import encode_frames
 
-    print(f"  [{encoder}] encoding {len(data['clips'])} clips ...")
-    Fr = encode_frames(encoder, data["clips"], dev, batch).cpu()
+    print(f"  [{encoder}/{frames or 'all'}] encoding {len(data['clips'])} clips ...")
+    Fr = encode_frames(encoder, data["clips"], dev, batch, frames=frames).cpu()
     torch.save({"F": Fr.half(), "label": data["label"]}, path)
     return Fr.float()
+
+
+def video_native_variants(encoder: str, data, dev: str, batch: int = 32) -> Dict[str, torch.Tensor]:
+    """Order-aware variants for the T=1 (video-native) encoders.
+
+    X-CLIP / ViCLIP collapse frames inside the encoder, so relation_probe.variants() can only
+    produce 'mean' -- there is no frame axis in the output to split into halves. That makes
+    them untestable for order sensitivity, which is precisely the capability they are supposed
+    to have and the reason to prefer them over an image tower.
+
+    So build the comparison at the encoder INPUT instead: run the encoder separately on the
+    first half of the clip and the second half.
+
+        first8 / last8   the two halves, each encoded independently  -> concat = 'halves'
+        shuffled         frames in random order
+
+    'shuffled' is the control that decides whether the rest means anything. An encoder that is
+    genuinely order-sensitive MUST produce a different embedding when the order is destroyed.
+    If halves beats mean but shuffled also beats mean, the probe is reading appearance.
+    """
+    ident = get_frame_feats(encoder, data, dev, batch, frames=None)[:, 0]
+    first = get_frame_feats(encoder, data, dev, batch, frames="first")
+    last = get_frame_feats(encoder, data, dev, batch, frames="last")
+    shuf = get_frame_feats(encoder, data, dev, batch, frames="shuffled")
+    a, b = first[:, 0], last[:, 0]
+    return {
+        "vmean": ident,                                        # whole clip, natural order
+        "vhalves": torch.cat([a, b], dim=1),
+        "vdelta": torch.cat([a, b - a], dim=1),
+        "vshuf": shuf[:, 0],
+        # identity vs shuffled: SAME frames, SAME count, only the order differs, so any
+        # drop in cosine is attributable to the encoder using frame order and nothing else.
+        "order_sensitivity": (ident * shuf[:, 0]).sum(-1),
+    }
 
 
 def pair_feature_sets(X: torch.Tensor, labels: torch.Tensor, captions) -> List[Dict[str, torch.Tensor]]:
@@ -75,7 +115,8 @@ def main():
 
     data = torch.load(a.data, weights_only=False)
     labels, captions = data["label"], data["captions"]
-    print(f"{len(labels)} clips, {len(captions)} templates\n")
+    n_frames = data["clips"].shape[1]
+    print(f"{len(labels)} clips, {len(captions)} templates, {n_frames} frames\n")
     results: Dict[str, Dict] = {}
     for enc in a.encoders:
         print(f"===== {enc} " + "=" * (54 - len(enc)))
@@ -84,18 +125,40 @@ def main():
         except Exception as e:
             print(f"  SKIPPED: {type(e).__name__}: {e}\n")
             continue
-        vs = variants(Fr)
-        if Fr.shape[1] >= 2:                       # order-destroyed control
+
+        vs = {}
+        sens = None
+        if Fr.shape[1] >= 2:
+            # per-frame encoder (CLIP): split the frame axis directly
+            vs = variants(Fr)
             g = torch.Generator().manual_seed(0)
             perm = torch.stack([torch.randperm(Fr.shape[1], generator=g) for _ in range(len(Fr))])
             vs["halves_shuf"] = variants(torch.gather(Fr, 1, perm[..., None].expand_as(Fr)))["halves"]
+        else:
+            # T=1 (video-native): no frame axis survives, so run the encoder on frame
+            # SUBSETS instead. Needs >=2 frames to split at all.
+            if n_frames < 2:
+                print("  only 1 frame per clip; cannot build an order-aware probe\n")
+                continue
+            vv = video_native_variants(enc, data, a.device)
+            sens = vv.pop("order_sensitivity")
+            vs = vv
+
         results[enc] = {}
+        if sens is not None:
+            # Does the encoder respond to frame ORDER at all? If cosine(identity, shuffled)
+            # is ~1.0 the model is order-blind and every order-aware score below is appearance.
+            m = sens.mean().item()
+            print(f"  order sensitivity: cosine(identity, shuffled) = {m:.4f}   "
+                  f"({'ORDER-SENSITIVE' if m < 0.999 else 'ORDER-BLIND -> order-aware scores are appearance'})")
+            results[enc]["_order_sensitivity_cosine"] = m
         for name, X in vs.items():
             r = probe_macro(pair_feature_sets(X, labels, captions), n_perm=a.n_perm)
             results[enc][name] = r
             if r.get("n_pairs", 0):
+                sig = "  <-- SIGNIFICANT" if r["p_value"] < 0.05 else ""
                 print(f"  {name:12s} macro AUC {r['macro_auc']:.3f}  null {r['null_mean']:.3f} "
-                      f"(p95 {r['null_p95']:.3f})  p={r['p_value']:.3f}  ({r['n_pairs']} pairs)")
+                      f"(p95 {r['null_p95']:.3f})  p={r['p_value']:.3f}  ({r['n_pairs']} pairs){sig}")
             else:
                 print(f"  {name:12s} no usable pairs (need >=3 clips per template)")
         print()
