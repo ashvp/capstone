@@ -22,7 +22,10 @@ Also reports:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import os
+import sys
 from typing import Dict, List, Optional
 
 import torch
@@ -30,77 +33,280 @@ import torch.nn.functional as F
 
 from .ssv2_data import ANTONYM_PAIRS
 
+# clip   openai/clip-vit-base-patch16    image tower, max over frames. No temporal
+#                                       modelling at all -- the control.
+# xclip  microsoft/xclip-base-patch16   CLIP fine-tuned ON VIDEO, temporal transformer
+#                                       added. Same family, so clip-vs-xclip isolates
+#                                       "does video pretraining buy relation
+#                                       sensitivity?". No extra dependencies.
+# viclip  OpenGVLab/ViCLIP-B-16-hf    CLIP fine-tuned on 10M video-text pairs
+#                                       (InternVid) with spatiotemporal attention built
+#                                       into the ViT, replacing per-frame max-pooling.
+#                                       LOCAL SNAPSHOT, not pip-installable: see
+#                                       _load_viclip for the fetch and patch notes.
+# egovlpv2  egocentric VLP with fusion in the backbone. NOT pip-installable; see
+#           _load_egovlp for the install note.
+HF_IDS = {"clip": "openai/clip-vit-base-patch16", "xclip": "microsoft/xclip-base-patch16"}
+# Hardcoded rather than read from AutoProcessor: transformers>=5 requires Pillow /
+# torchvision for the image processor, and these constants are fixed per checkpoint.
+# NOTE they are NOT the same -- X-CLIP inherits VideoMAE's ImageNet stats, not CLIP's.
+# Using CLIP's numbers on X-CLIP would silently degrade it and flatter the comparison.
+NORM = {
+    "clip":   ([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+    "xclip":  ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    # ViCLIP is initialised from OpenAI CLIP and inherits its preprocessing; its own
+    # frames2tensor() helper uses exactly these constants.
+    "viclip": ([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+}
+EGOVLP = ("egovlpv2", "egovlp")
+XCLIP_FRAMES = 8          # X-CLIP is trained with 8 frames; our clips have 16
+
+
+def _unwrap(out):
+    """transformers 5.x returns BaseModelOutputWithPooling; older returned a tensor."""
+    for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+        if hasattr(out, attr):
+            return getattr(out, attr)
+    return out
+
 
 # --------------------------------------------------------------------------- encoders
 def encode_clip(name: str, clips: torch.Tensor, dev: str, batch: int = 32):
-    """(N,F,3,H,W) uint8 -> (N,D) L2-normalised, max-pooled over frames."""
-    if name == "clip":
-        from transformers import CLIPModel, CLIPProcessor
+    """(N,F,3,H,W) uint8 -> (N,D) L2-normalised."""
+    if name in HF_IDS:
+        from transformers import AutoModel, AutoProcessor
 
-        m = CLIPModel.from_pretrained("openai/clip-vit-base-patch16",
-                                      torch_dtype=torch.float32).to(dev).eval()
-        p = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
-        mean = torch.tensor(p.image_processor.image_mean, device=dev).view(1, 3, 1, 1)
-        std = torch.tensor(p.image_processor.image_std, device=dev).view(1, 3, 1, 1)
-
+        mid = HF_IDS[name]
+        model = AutoModel.from_pretrained(mid, torch_dtype=torch.float32).to(dev).eval()
         outs = []
         with torch.no_grad():
-            for i in range(0, len(clips), batch):
-                x = clips[i : i + batch].to(dev).float().div_(255.0)
-                x = x.flatten(0, 1)                                     # (B*F,3,H,W)
-                x = F.interpolate(x, size=(224, 224), mode="bicubic", align_corners=False)
-                x = ((x - mean) / std).clamp(0, 1)
-                f = m.get_image_features(pixel_values=x)
-                for attr in ("image_embeds", "pooler_output"):
-                    if hasattr(f, attr):
-                        f = getattr(f, attr)
-                        break
-                f = F.normalize(f.float(), dim=-1).view(-1, clips.shape[1], -1)
-                outs.append(f.max(dim=1).values)                      # max over frames
-        del m
-        torch.cuda.empty_cache()
+            if name == "xclip":
+                k = min(XCLIP_FRAMES, clips.shape[1])
+                sel = torch.linspace(0, clips.shape[1] - 1, k).round().long()
+                for i in range(0, len(clips), batch):
+                    x = _prep(clips[i : i + batch][:, sel], dev)
+                    outs.append(F.normalize(_unwrap(model.get_video_features(
+                        pixel_values=x)).float(), dim=-1))
+            else:
+                mean, std = _norm_stats(name, dev)
+                for i in range(0, len(clips), batch):
+                    chunk = clips[i : i + batch].to(dev).float().div_(255.0)
+                    b, f = chunk.shape[:2]
+                    x = F.interpolate(chunk.flatten(0, 1), size=(224, 224),
+                                      mode="bicubic", align_corners=False)
+                    x = ((x.view(b, f, 3, 224, 224) - mean) / std).clamp(0, 1)
+                    feat = F.normalize(_unwrap(
+                        model.get_image_features(pixel_values=x.flatten(0, 1))).float(), dim=-1)
+                    # (B*F, D) -> (B, F, D). Two -1s is illegal, torch infers only one.
+                    outs.append(F.normalize(feat.view(b, f, -1).max(dim=1).values, dim=-1))
+        del model
+        if dev.startswith("cuda"):
+            torch.cuda.empty_cache()
         return torch.cat(outs)
 
-    if name in ("egovlpv2", "egovlp"):
+    if name == "viclip":
+        return _encode_viclip(clips, dev, batch)
+
+    if name in EGOVLP:
         return _encode_egovlp(clips, dev, batch)
 
     raise ValueError(f"unknown encoder {name!r}")
 
 
-def encode_text(name: str, sentences: List[str], dev: str) -> torch.Tensor:
-    if name == "clip":
-        from transformers import CLIPModel, CLIPTokenizer
+def _prep(clips: torch.Tensor, dev: str, size: int = 224):
+    """(N,F,3,H,W) uint8 -> (N,F,3,size,size) float in [0,1]."""
+    x = clips.to(dev).float().div_(255.0)
+    b, f = x.shape[:2]
+    x = F.interpolate(x.flatten(0, 1), size=(size, size), mode="bicubic", align_corners=False)
+    return x.view(b, f, 3, size, size).clamp(0, 1)
 
-        m = CLIPModel.from_pretrained("openai/clip-vit-base-patch16",
-                                      torch_dtype=torch.float32).to(dev).eval()
-        tok = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+
+def _norm_stats(name: str, dev: str):
+    m, s = NORM[name]
+    return (torch.tensor(m, device=dev).view(1, 1, 3, 1, 1),
+            torch.tensor(s, device=dev).view(1, 1, 3, 1, 1))
+
+
+def encode_text(name: str, sentences: List[str], dev: str) -> torch.Tensor:
+    if name in HF_IDS:
+        from transformers import AutoModel, AutoTokenizer
+
+        mid = HF_IDS[name]
+        tok = AutoTokenizer.from_pretrained(mid)
+        model = AutoModel.from_pretrained(mid, torch_dtype=torch.float32).to(dev).eval()
         with torch.no_grad():
-            f = m.get_text_features(**tok(sentences, return_tensors="pt", padding=True))
-            for attr in ("text_embeds", "pooler_output"):
-                if hasattr(f, attr):
-                    f = getattr(f, attr)
-                    break
-            out = F.normalize(f.float(), dim=-1)
-        del m
-        torch.cuda.empty_cache()
+            enc = tok(list(sentences), return_tensors="pt", padding=True, truncation=True).to(dev)
+            out = F.normalize(_unwrap(model.get_text_features(**enc)).float(), dim=-1)
+        del model
+        if dev.startswith("cuda"):
+            torch.cuda.empty_cache()
         return out
 
-    if name in ("egovlpv2", "egovlp"):
+    if name == "viclip":
+        return _viclip_text(sentences, dev)
+
+    if name in EGOVLP:
         return _egovlp_text(sentences, dev)
 
     raise ValueError(f"unknown encoder {name!r}")
+
+
+# --------------------------------------------------------------------------- viclip
+VICLIP_DIR = os.environ.get(
+    "VICLIP_DIR", "hf_cache/models--OpenGVLab--ViCLIP-B-16-hf")
+_VC = {}
+
+
+def _load_viclip(dev: str):
+    """ViCLIP-B-16 (InternVid, arXiv:2307.06942). Loaded from a LOCAL snapshot via
+    trust_remote_code, because there is no pip package -- fetch it with:
+
+        python tools/fetch_viclip.py
+
+    Two patches are needed to run this 2023 remote code under transformers 5.x, both
+    of which fail *after* the weights are already loaded, so neither raises a useful
+    error on its own:
+
+    1. `all_tied_weights_keys` -- transformers 5.x reads this attribute while
+       finalising weight loading. The remote code predates it, so __getattr__ raises
+       AttributeError once the safetensors are in place. Give the base class the empty
+       default it expects rather than editing the vendored source.
+
+    2. The text tower's causal attention mask is built in __init__ by an
+       lru_cache'd method and stored as a PLAIN attribute, not a registered buffer.
+       transformers 5.x builds the model on the meta device, so the mask is
+       allocated on meta, is never replaced by the checkpoint (it has no key), and
+       fails at the first forward with "Cannot copy out of meta tensor". Rebuild it on
+       a real device after loading.
+
+    VERIFIED CLEAN: 303/303 checkpoint tensors load bit-exact, and encode_vision is
+    batch-invariant -- cosine(B=1, B=16) = 1.0000 on the same 24 clips, and
+    identical with and without a hand-written CLS-token workaround. The `x[:B]`
+    indexing in viclip_vision.py:171 *looks* wrong for B>1 (it slices the first B
+    rows of a B*T-row tensor) but a candidate fix was measured to change nothing, so
+    no monkey-patch is applied. Do not "fix" it without a failing test.
+    """
+    if "m" in _VC:
+        return _VC["m"]
+    from transformers import AutoConfig, AutoModel
+    from transformers.modeling_utils import PreTrainedModel
+
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = {}
+
+    if not os.path.isdir(VICLIP_DIR):
+        raise RuntimeError(
+            f"ViCLIP snapshot not found at {os.path.abspath(VICLIP_DIR)!r}. "
+            f"Run: python tools/fetch_viclip.py  (or set VICLIP_DIR)"
+        )
+    cfg = AutoConfig.from_pretrained(VICLIP_DIR, trust_remote_code=True)
+    # The repo's config carries tokenizer_path="./bpe_simple_vocab_16e6.txt.gz",
+    # resolved relative to the CWD -- but trust_remote_code executes the model from
+    # ~/.cache/huggingface/modules/, where that vocab file does not exist. Absolute.
+    cfg.tokenizer_path = os.path.abspath(
+        os.path.join(VICLIP_DIR, "bpe_simple_vocab_16e6.txt.gz"))
+    m = AutoModel.from_pretrained(VICLIP_DIR, config=cfg, trust_remote_code=True)
+
+    m.vision_encoder.transformer.checkpoint_num = 0   # training-time only; warns under no_grad
+    type(m.text_encoder).build_attention_mask.cache_clear()
+    mask = m.text_encoder.build_attention_mask()
+    for blk in m.text_encoder.transformer.resblocks:
+        blk.attn_mask = mask
+    print(f"    viclip: {m.vision_encoder_name}/{m.text_encoder_name}, "
+          f"{m.video_input_num_frames} frames, ctx={m.max_txt_l}, mask on {mask.device}")
+    _VC["m"] = m = m.to(dev).eval()
+    return m
+
+
+def _encode_viclip(clips: torch.Tensor, dev: str, batch: int) -> torch.Tensor:
+    m = _load_viclip(dev)
+    # temporal_positional_embedding is (1, num_frames, width) and is BROADCAST, not
+    # checked, so feeding the wrong frame count either errors or silently reuses a
+    # single frame's embedding. Resample to exactly what the checkpoint was built with.
+    t = m.video_input_num_frames
+    sel = torch.linspace(0, clips.shape[1] - 1, t).round().long()
+    mean, std = _norm_stats("viclip", dev)
+    outs = []
+    with torch.no_grad():
+        for i in range(0, len(clips), batch):
+            x = _prep(clips[i : i + batch][:, sel], dev)     # (B,t,3,224,224) in [0,1]
+            x = (x - mean) / std                              # CLIP stats, NOT clamped
+            # encode_vision permutes (B,T,C,H,W) -> (B,C,T,H,W) for the 3D conv and
+            # returns a single pooled (B,512) vector -- the docstring's promised tuple
+            # is not what the code returns.
+            outs.append(F.normalize(m.encode_vision(x, test=True).float(), dim=-1))
+    return torch.cat(outs)
+
+
+def _viclip_text(sentences: List[str], dev: str) -> torch.Tensor:
+    m = _load_viclip(dev)
+    with torch.no_grad():
+        return F.normalize(m.encode_text(list(sentences)).float(), dim=-1)
 
 
 _EG = {}
 
 
 def _load_egovlp(dev: str):
-    if "m" not in _EG:
-        from egovlpv2.models import EgoVLPv2  # pip install from the official repo
-        m = EgoVLPv2(pretrained=True)
-        m = m.to(dev).eval()
-        _EG["m"] = m
-    return _EG["m"]
+    """EgoVLPv2 (ICCV'23). NOT pip-installable -- the repo has no setup.py/pyproject.
+
+    Do NOT `pip install -r requirements.txt`: it pins torch==1.13.1+cu116 and
+    numpy==1.23.5, neither of which has Python 3.13 wheels, and both would break the
+    Kaggle image. Install only the light deps and put the repo on sys.path:
+
+        !git clone https://github.com/facebookresearch/EgoVLPv2.git
+        !pip install -q timm einops yacs
+        # then: export EGOVLP_REPO=/kaggle/working/EgoVLPv2
+
+    The package directory is capitalised (`EgoVLPv2/`) and must be imported from the
+    repo ROOT, so the module path is `EgoVLPv2.model`, not `egovlpv2.models`.
+    """
+    if "m" in _EG:
+        return _EG["m"]
+    repo = os.environ.get("EGOVLP_REPO", "/kaggle/working/EgoVLPv2")
+    if not os.path.isdir(repo):
+        raise RuntimeError(
+            f"EgoVLPv2 repo not found at {repo!r}. Clone facebookresearch/EgoVLPv2 and set "
+            f"EGOVLP_REPO, or just run: --encoders clip xclip"
+        )
+    sys.path.insert(0, repo)
+    try:
+        from EgoVLPv2 import model as ego_model
+    except Exception as e:
+        raise RuntimeError(f"could not import EgoVLPv2.model from {repo}: {e}")
+
+    url = os.environ.get(
+        "EGOVLP_CKPT",
+        "http://www.cis.jhu.edu/~shraman/EgoVLPv2/ckpts/Pre-trained/EgoVLPv2.pth",
+    )
+    path = url
+    if url.startswith("http"):
+        path = os.path.join(repo, "EgoVLPv2.pth")
+        if not os.path.exists(path):
+            torch.hub.download_url_to_file(url, path)
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = ck.get("config")
+    if cfg is None:
+        raise RuntimeError(f"checkpoint {path} has no 'config' key; keys={list(ck)[:8]}")
+
+    # Find the class rather than hardcoding a name -- the repo ships several variants
+    # (EgoMQ, EgoNLQ, Charades) and only the pretraining one takes a config.
+    cls = None
+    for name, obj in vars(ego_model).items():
+        if not (isinstance(obj, type) and issubclass(obj, torch.nn.Module)):
+            continue
+        if "egovlpv2" in name.lower() and "config" in inspect.signature(obj.__init__).parameters:
+            cls = obj
+            break
+    if cls is None:
+        raise RuntimeError("no config-accepting EgoVLPv2 class in EgoVLPv2.model; found: "
+                           f"{[k for k in vars(ego_model) if 'Ego' in k]}")
+    m = cls(cfg)
+    missing = m.load_state_dict(ck.get("state_dict", ck), strict=False)
+    print(f"    egovlpv2: {cls.__name__}, ckpt keys={list(ck)[:4]}, "
+          f"missing={len(missing.missing_keys)}, unexpected={len(missing.unexpected_keys)}")
+    _EG["m"] = m = m.to(dev).eval()
+    return m
 
 
 def _encode_egovlp(clips: torch.Tensor, dev: str, batch: int) -> torch.Tensor:
@@ -108,10 +314,7 @@ def _encode_egovlp(clips: torch.Tensor, dev: str, batch: int) -> torch.Tensor:
     outs = []
     with torch.no_grad():
         for i in range(0, len(clips), batch):
-            x = clips[i : i + batch].to(dev).float().div_(255.0)
-            x = F.interpolate(x.flatten(0, 1), size=(224, 224), mode="bicubic", align_corners=False)
-            x = x.view(-1, clips.shape[1], 3, 224, 224)
-            outs.append(F.normalize(m.encode_video(x).float(), dim=-1))
+            outs.append(F.normalize(m.encode_video(_prep(clips[i : i + batch], dev)).float(), dim=-1))
     return torch.cat(outs)
 
 
@@ -179,7 +382,7 @@ def evaluate(data, encoder: str, dev: str) -> Dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="runs/ssv2_pairs.pt")
-    ap.add_argument("--encoders", nargs="*", default=["clip", "egovlpv2"])
+    ap.add_argument("--encoders", nargs="*", default=["clip", "xclip"])
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="runs/gate2_encoder_bakeoff.json")
     a = ap.parse_args()

@@ -33,8 +33,17 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
+
+# SSv2 captions and polars' DataFrame repr contain non-ASCII characters; the Windows
+# console defaults to cp1252 and raises UnicodeEncodeError on print.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import torch
 
@@ -291,29 +300,29 @@ class TemplateMatcher:
 
 
 def read_captions(tasks) -> List[str]:
-    """This mirror stores captions in the parquet INDEX; the column holds integer ids.
+    """Captions live in this mirror's serialised pandas INDEX; the column holds int ids.
 
-    Handles both layouts: use the index when it is textual, else fall back to the one
-    string-valued column. Raises rather than silently returning integers, which is what
-    made an earlier version of this script match 0/41 targets with no explanation.
+    polars drops that index unless include_index=True, hence the caller. Prefer a
+    caption-named column, then the index, then any all-string column. Raises rather
+    than silently returning integers -- that silent failure is what produced an
+    unexplained 0/41 target match earlier.
     """
-    index_txt = [_norm(x) for x in tasks.index]
-    if index_txt and any(c and not c.replace(".", "", 1).isdigit() for c in index_txt[:50]):
-        print(f"  captions read from tasks.parquet INDEX ({len(index_txt)} rows)")
-        return index_txt
+    def all_str(col):
+        vals = tasks[col].to_list()[:200]
+        return bool(vals) and all(isinstance(v, str) and v.strip() for v in vals)
 
-    for c in tasks.columns:
-        col = tasks[c]
-        if col.dtype == object:
-            vals = [_norm(x) for x in col.head(50)]
-            if any(v and not v.replace(".", "", 1).isdigit() for v in vals):
-                print(f"  captions read from column {c!r}")
-                return [_norm(x) for x in col]
+    order = [c for c in tasks.columns if c in ("task", "text", "caption", "instruction")]
+    order += [c for c in tasks.columns if c.startswith("__index_level_0__")]
+    order += [c for c in tasks.columns if c not in order]
 
-    raise SystemExit(
-        "could not find captions in tasks.parquet. "
-        f"index[:3]={list(tasks.index[:3])} columns={list(tasks.columns)}"
-    )
+    for c in order:
+        if c in tasks.columns and all_str(c):
+            vals = [_norm(v) for v in tasks[c].to_list()]
+            print(f"  captions read from column {c!r} ({len(vals)} rows)")
+            return vals
+
+    raise SystemExit(f"no textual column in tasks.parquet. columns={tasks.columns} "
+                     f"head={tasks.head(3).to_dicts()}")
 
 
 def download(chunk: int, file: int, cache: str) -> Tuple[str, str, str]:
@@ -345,20 +354,29 @@ def iter_frames(path: str):
 
 
 def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
-          max_frames: int = 16, cache: str = "hf_cache", videos_per_file: int = 1000):
+          max_frames: int = 16, cache: str = "hf_cache", videos_per_file: int = 1000,
+          offset_col: Optional[str] = None):
     import numpy as np
-    import pandas as pd
+    import polars as pl
+
+    def read_parquet(path: str):
+        # polars >=2 keeps a serialised pandas index as __index_level_0__ by default;
+        # older versions need include_index=True. Try both.
+        try:
+            return pl.read_parquet(path, include_index=True)
+        except TypeError:
+            return pl.read_parquet(path)
 
     tasks_p, data_p, video_p = download(chunk, file, cache)
     print(f"tasks : {tasks_p}\ndata  : {data_p}\nvideo : {video_p}")
 
-    tasks = pd.read_parquet(tasks_p)
-    frames = pd.read_parquet(data_p)
+    tasks = read_parquet(tasks_p)
+    frames = read_parquet(data_p)
 
-    print(f"\ntasks.parquet  columns={list(tasks.columns)}  rows={len(tasks)}")
-    print(f"  head:\n{tasks.head(3).to_string()}")
-    print(f"\ndata parquet   columns={list(frames.columns)}  rows={len(frames)}")
-    print(f"  head:\n{frames.head(5).to_string()}")
+    print(f"\ntasks.parquet  columns={tasks.columns}  rows={len(tasks)}")
+    print(f"  head:\n{tasks.head(3)}")
+    print(f"\ndata parquet   columns={frames.columns}  rows={len(frames)}")
+    print(f"  head:\n{frames.head(5)}")
 
     # --- column discovery: this mirror's names are not guaranteed -------------
     def pick(cols, *keywords, exclude=()):
@@ -379,19 +397,38 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
     fidx_col = pick(frames.columns, "frame_index", "frame")
     tidx_col = pick(frames.columns, "task_index", "task_id", "label")
     if not all([task_col, ep_col, fidx_col, tidx_col]):
-        raise SystemExit(f"could not resolve columns. tasks={list(tasks.columns)} frames={list(frames.columns)}")
-    print(f"\nresolved: caption={task_col!r} episode={ep_col!r} frame={fidx_col!r} task={tidx_col!r}")
+        raise SystemExit(f"could not resolve columns. tasks={tasks.columns} frames={frames.columns}")
 
-    frames = frames[[ep_col, fidx_col, tidx_col]].sort_values([ep_col, fidx_col])
-    print(f"episodes in this parquet: {frames[ep_col].nunique()}   rows: {len(frames)}")
+    # Which column is the ABSOLUTE frame offset into the concatenated mp4?
+    # `frame_index` resets to 0 in every episode, so it cannot be used to seek --
+    # keying a frame->episode map by it makes hundreds of episodes collide onto the
+    # same keys and silently collapses to a handful of clips. `index` is global.
+    #
+    # Detect it rather than assume: a global offset column is strictly increasing in
+    # row order (it counts frames across the whole concatenated file). A per-episode
+    # counter drops back to 0 at each episode boundary.
+    def is_global(col: str) -> bool:
+        return bool(frames.select((pl.col(col).diff().min() > 0).alias("g")).item())
+
+    cand = [c for c in (offset_col or "", "index", "global_index", "frame_offset") if c and c in frames.columns]
+    offset_col = next((c for c in cand if is_global(c)), None)
+    if offset_col is None:
+        raise SystemExit(
+            f"no global frame-offset column among {cand}. "
+            f"frame_index={fidx_col!r} restarts per episode and cannot be used to seek."
+        )
+    print(f"\nresolved: caption={task_col!r} episode={ep_col!r} task={tidx_col!r}")
+    print(f"  intra-episode frame number: {fidx_col!r}")
+    print(f"  GLOBAL mp4 offset column  : {offset_col!r}  (used for seeking)")
+    print(f"episodes in this parquet: {frames[ep_col].n_unique()}   rows: {len(frames)}")
 
     # --- the parquet may cover the whole dataset while the mp4 covers only the
     # first `videos_per_file` episodes. Restrict explicitly rather than decoding
     # 9.8M frames looking for clips that are not in this file.
-    all_eps = sorted(frames[ep_col].unique())
-    eps_here = all_eps[:videos_per_file]
+    all_eps = sorted(frames[ep_col].unique().to_list())
+    eps_here = set(all_eps[:videos_per_file])
     print(f"episodes present in THIS mp4 (first {videos_per_file}): {len(eps_here)}")
-    frames = frames[frames[ep_col].isin(eps_here)]
+    frames = frames.filter(pl.col(ep_col).is_in(list(eps_here)))
 
     captions = read_captions(tasks)
     print(f"distinct captions: {len(set(captions))}")
@@ -399,20 +436,21 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
     # --- caption -> official template id, longest match wins ------------------
     matcher = TemplateMatcher()
     print(f"matching {len(captions)} captions against {len(OFFICIAL_TEMPLATES)} templates ...")
-    cap_of_task: Dict[int, str] = {}
+    task_ids = tasks[tidx_col].to_list()
     tid_of_task: Dict[int, int] = {}
-    unparsed = 0
-    for t in tasks.itertuples():
-        tid = int(getattr(t, tidx_col))
-        cap = captions[tid] if tid < len(captions) else ""
-        cap_of_task[tid] = cap
-        m = matcher.match(cap)
-        if m is None:
-            unparsed += 1
-        else:
+    example: Dict[int, str] = {}
+    for tid in task_ids:
+        tid = int(tid)
+        if not (0 <= tid < len(captions)):
+            continue
+        m = matcher.match(captions[tid])
+        if m is not None and m not in example:
+            example[m] = captions[tid]
+        if m is not None:
             tid_of_task[tid] = m
-    print(f"  captions matching no template: {unparsed}/{len(captions)} "
-          f"({100*unparsed/max(1,len(captions)):.1f}%) -- this mirror drops some prepositions")
+    unparsed = len(set(task_ids)) - len(tid_of_task)
+    print(f"  captions matching no template: {unparsed}/{len(set(task_ids))} "
+          f"({100*unparsed/max(1,len(set(task_ids))):.1f}%) -- this mirror drops some prepositions")
 
     hit = Counter(tid_of_task.values())
     matched_set = {OFFICIAL_TEMPLATES[t] for t in hit} & set(CONTRASTS)
@@ -425,18 +463,10 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
         print(f"\n  NOT PRESENT ({len(missing)}): " + "; ".join(missing))
 
     # Verify before trusting: real captions per target, so mis-mappings are visible.
-    print("\n--- VERIFICATION: sample captions per matched target (eyeball these) ---")
-    shown: Counter = Counter()
-    for tid in sorted(tid_of_task.values()):
-        name = OFFICIAL_TEMPLATES[tid]
-        if name not in CONTRASTS or shown[name] >= 3:
-            continue
-        for t2 in tasks.itertuples():
-            k = int(getattr(t2, tidx_col))
-            if tid_of_task.get(k) == tid:
-                print(f"  {name:52s} <- {captions[k]}")
-                shown[name] += 1
-                break
+    print("\n--- VERIFICATION: sample caption per matched target (eyeball these) ---")
+    for name in matched:
+        tid = TEMPLATE_IDS[name]
+        print(f"  {name:52s} <- {example.get(tid, '(none)')}")
 
     if len(matched) < 4:
         raise SystemExit(
@@ -448,14 +478,19 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
     gid_of_cap = {_norm(m): i for i, m in enumerate(matched)}
     cap_lookup = {v: k for k, v in gid_of_cap.items()}
 
-    # first pass: which episodes to keep, and their frame span
+    # first pass: which episodes to keep, and their mp4 offset span
     lab_of_ep: Dict[int, int] = {}
     cap_of_ep: Dict[int, str] = {}
     spans: Dict[int, Tuple[int, int]] = {}
     counts: Dict[int, int] = {}
-    for ep, g in frames.groupby(ep_col):
-        ep = int(ep)
-        tid = tid_of_task.get(int(g[tidx_col].iloc[0]))
+    for row in (frames.group_by(ep_col)
+                    .agg(pl.col(offset_col).min().alias("lo"),
+                         pl.col(offset_col).max().alias("hi"),
+                         pl.col(tidx_col).first().alias("tidx"))
+                    .sort(ep_col)
+                    .iter_rows()):
+        ep, lo, hi, tidx = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        tid = tid_of_task.get(tidx)
         if tid is None:
             continue
         name = OFFICIAL_TEMPLATES[tid]
@@ -465,19 +500,35 @@ def build(out: str, chunk: int = 0, file: int = 0, limit_per_template: int = 24,
         counts[gid] = counts.get(gid, 0) + 1
         lab_of_ep[ep] = gid
         cap_of_ep[ep] = name
-        spans[ep] = (int(g[fidx_col].min()), int(g[fidx_col].max()))
+        spans[ep] = (lo, hi)
 
     if not lab_of_ep:
-        raise SystemExit("no matching episodes -- check template strings against this dataset's captions")
-    last_frame = max(spans[ep][1] for ep in lab_of_ep)
-    print(f"\nkeeping {len(lab_of_ep)} episodes")
-    print(f"need to decode frames 0..{last_frame}")
+        raise SystemExit("no matching episodes -- captions mapped but none in this mp4")
 
-    # frame index -> owning episode. O(1) lookup, no scan per frame.
-    frame_owner: Dict[int, int] = {}
+    # Guard against the per-episode-frame_index bug: with a local offset column the
+    # spans of different episodes overlap, which would silently yield a few clips.
+    owner: Dict[int, int] = {}
+    overlaps = 0
     for ep, (lo, hi) in spans.items():
         for f in range(lo, hi + 1):
-            frame_owner[f] = ep
+            if f in owner:
+                overlaps += 1
+            owner[f] = ep
+    last_frame = max(hi for _, hi in spans.values())
+    print(f"\nkeeping {len(lab_of_ep)} episodes")
+    print(f"  span {min(lo for lo,_ in spans.values())}..{last_frame} using {offset_col!r}")
+    if overlaps:
+        raise SystemExit(
+            f"{overlaps} colliding frame offsets across {len(lab_of_ep)} episodes -- "
+            f"{offset_col!r} is not a global mp4 offset. Cannot seek reliably."
+        )
+    if last_frame > 200_000:
+        print(f"  WARNING: last_frame={last_frame} implies {last_frame/45:.0f} episodes; "
+              f"this mp4 may not be the chunk the parquet describes.")
+    print(f"need to decode frames 0..{last_frame}")
+
+    # `owner` (built for the collision guard above) is the frame -> episode map.
+    frame_owner = owner
 
     clips, labels, caps = [], [], []
     buf: List[torch.Tensor] = []
@@ -537,8 +588,11 @@ def main():
     ap.add_argument("--cache", default="hf_cache")
     ap.add_argument("--videos-per-file", type=int, default=1000,
                     help="episodes present in each mp4; the data parquet is dataset-wide")
+    ap.add_argument("--offset-col", default=None,
+                    help="column holding the global mp4 frame offset (auto-detected; usually 'index')")
     a = ap.parse_args()
-    build(a.out, a.chunk, a.file, a.limit_per_template, a.max_frames, a.cache, a.videos_per_file)
+    build(a.out, a.chunk, a.file, a.limit_per_template, a.max_frames, a.cache,
+          a.videos_per_file, a.offset_col)
 
 
 if __name__ == "__main__":

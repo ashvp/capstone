@@ -1,0 +1,44 @@
+# Default config. Paths are relative to the repo root; override with --set key=value.
+text_bank: data/text_bank.pt        # (1728, 512) CLIP text embeddings of all hypothesis sentences
+seed: 0
+val_frac: 0.1                       # validation split carved from the TRAINING source (never a test benchmark)
+out: runs/default
+device: auto
+amp: false                          # heads are tiny; fp32 is fine. bf16 needs Ampere (A40 ok, T4 not)
+workers: 4
+
+model:
+  d: 256
+  n_layers: 2
+  n_heads: 4
+  max_T: 64
+  dropout: 0.1
+  tau: 0.07
+
+stage1:                             # relational pretraining on clips with known slot tuples (e.g. SSv2 mapped to slots)
+  train: data/stage1_train.pt
+  epochs: 20
+  bs: 128
+  lr: 3.0e-4
+  wd: 0.05
+  K: 16                             # negatives per anchor
+  neg_mode: single                  # single | multi | random   <- the central ablation
+  margin: 0.2
+  lam_margin: 0.5
+  lam_inv: 0.5
+
+stage2:                             # weak-label VAD adaptation (video-level labels + pseudo hypotheses)
+  train: data/stage2_train.pt
+  init: runs/default/stage1/best.pt
+  epochs: 20
+  bs: 32
+  lr: 1.0e-4
+  wd: 0.05
+  K: 16
+  neg_mode: single
+  margin: 0.2
+  lam_nce: 0.5
+  lam_margin: 0.25
+  lam_inv: 0.5
+  lam_rule: 0.0                     # >0 adds a weak prior from slots.ABNORMAL_RULES; keep 0 for the main results
+  k_frac: 0.125                     # top-k fraction for MIL pooling

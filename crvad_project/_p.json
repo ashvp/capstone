@@ -1,0 +1,16 @@
+﻿import json, sys
+# Check the gate results we already have
+for f in ["gate1_text_separability.json", "gate2_encoder_bakeoff.json", "gate2_linear_probe.json", "gate2_viclip_bakeoff.json"]:
+    try:
+        d = json.load(open(f"runs/{f}"))
+        print(f"\n=== {f} ===")
+        if "edit_acc" in d:
+            print(f"  edit_acc: {d[\"edit_acc\"]:.3f}  CI [{d[\"edit_acc_ci95\"][0]:.3f}, {d[\"edit_acc_ci95\"][1]:.3f}]")
+        if "template_retrieval" in d:
+            print(f"  template_retrieval: {d[\"template_retrieval\"]:.3f}  (chance {d[\"retrieval_chance\"]:.3f})")
+        if "zeroshot_edit_acc" in d:
+            print(f"  zero-shot edit_acc: {d[\"zeroshot_edit_acc\"]:.3f}")
+        if "probe_acc" in d:
+            print(f"  probe_acc: {d[\"probe_acc\"]:.3f}  (chance {d[\"probe_chance\"]:.3f})")
+    except Exception as e:
+        print(f"\n=== {f} === ERROR: {e}")

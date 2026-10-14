@@ -1,0 +1,1142 @@
+diff -ruN -x __pycache__ orig/crvad_project/configs/default.yaml new/crvad_project/configs/default.yaml
+--- orig/crvad_project/configs/default.yaml	2026-10-12 08:11:35.000000000 +0000
++++ new/crvad_project/configs/default.yaml	2026-10-13 06:46:59.360514746 +0000
+@@ -4,7 +4,7 @@
+ val_frac: 0.1                       # validation split carved from the TRAINING source (never a test benchmark)
+ out: runs/default
+ device: auto
+-amp: true                           # bf16 autocast on A40 (Ampere)
++amp: false                          # heads are tiny; fp32 is fine. bf16 needs Ampere (A40 ok, T4 not)
+ workers: 4
+ 
+ model:
+diff -ruN -x __pycache__ orig/crvad_project/crvad/evaluate.py new/crvad_project/crvad/evaluate.py
+--- orig/crvad_project/crvad/evaluate.py	2026-10-12 08:11:35.000000000 +0000
++++ new/crvad_project/crvad/evaluate.py	2026-10-13 06:46:59.353878939 +0000
+@@ -89,15 +89,18 @@
+     if pairs is not None:
+         s0 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["feats0"]), k_frac)
+         s1 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["feats1"]), k_frac)
+-        n0 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis0"]), k_frac)
+-        n1 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis1"]), k_frac)
++        has_nuis = "nuis0" in pairs and "nuis1" in pairs
++        if has_nuis:
++            n0 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis0"]), k_frac)
++            n1 = CRVADModel.video_score(seg_scores(model, text_emb, pairs["nuis1"]), k_frac)
+         held = pairs["heldout"].bool()
+         for name, m in {"all": torch.ones_like(held), "seen": ~held, "heldout": held}.items():
+             if not m.any():
+                 continue
+             r = {"flip_acc": float((s1[m] > s0[m]).float().mean()),
+-                 "flip_acc_nuis": float((n1[m] > n0[m]).float().mean()),
+                  "score_gap": float((s1[m] - s0[m]).mean())}
++            if has_nuis:
++                r["flip_acc_nuis"] = float((n1[m] > n0[m]).float().mean())
+             feats = torch.cat([pairs["feats0"][m], pairs["feats1"][m]])
+             slots = torch.cat([pairs["slots0"][m], pairs["slots1"][m]])
+             overall, per = edit_accuracy(model, text_emb, feats, slots)
+diff -ruN -x __pycache__ orig/crvad_project/crvad/features.py new/crvad_project/crvad/features.py
+--- orig/crvad_project/crvad/features.py	2026-10-12 08:11:35.000000000 +0000
++++ new/crvad_project/crvad/features.py	2026-10-13 06:46:41.935240547 +0000
+@@ -20,6 +20,27 @@
+ CLIP = "openai/clip-vit-base-patch16"
+ 
+ 
++def _unwrap(out):
++    """transformers>=5 returns BaseModelOutputWithPooling from get_*_features; older returned a tensor."""
++    for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
++        if hasattr(out, attr):
++            return getattr(out, attr)
++    return out
++
++
++def window_starts(n_frames: int, per: int) -> List[int]:
++    """Start index of every window of `per` sampled frames. The last window is right-aligned
++    (overlapping the previous one) so the video tail is always covered -- v1 dropped it, and on
++    surveillance video that is often where the anomaly is. Videos shorter than `per` give one
++    window that the caller pads."""
++    if n_frames <= per:
++        return [0]
++    starts = list(range(0, n_frames - per + 1, per))
++    if starts[-1] + per < n_frames:
++        starts.append(n_frames - per)
++    return starts
++
++
+ def _load_clip(dev):
+     from transformers import CLIPModel, CLIPProcessor
+     m = CLIPModel.from_pretrained(CLIP, torch_dtype=torch.float16).to(dev).eval()
+@@ -33,7 +54,7 @@
+     embs = []
+     for i in range(0, len(sents), 256):
+         t = p(text=sents[i:i + 256], return_tensors="pt", padding=True).to(dev)
+-        embs.append(torch.nn.functional.normalize(m.get_text_features(**t).float(), dim=-1).cpu())
++        embs.append(torch.nn.functional.normalize(_unwrap(m.get_text_features(**t)).float(), dim=-1).cpu())
+     torch.save(torch.cat(embs), out)
+ 
+ 
+@@ -57,7 +78,7 @@
+ @torch.no_grad()
+ def _encode(m, p, frames: List[torch.Tensor], dev) -> torch.Tensor:
+     x = p(images=[f for f in frames], return_tensors="pt", do_rescale=True).pixel_values.to(dev, torch.float16)
+-    return torch.nn.functional.normalize(m.get_image_features(pixel_values=x).float(), dim=-1).cpu()
++    return torch.nn.functional.normalize(_unwrap(m.get_image_features(pixel_values=x)).float(), dim=-1).cpu()
+ 
+ 
+ def extract_windows(paths: List[str], out: str, T: int = 32, seg_frames: int = 8, fps_sample: float = 2.0,
+@@ -72,7 +93,7 @@
+             continue
+         fr = _read_frames(path, fps_sample)
+         per = T * seg_frames
+-        for w0 in range(0, max(1, len(fr) - per + 1), per):
++        for w0 in window_starts(len(fr), per):
+             win = fr[w0:w0 + per]
+             if len(win) < per:                       # pad the tail by repeating the last frame
+                 win = win + [win[-1]] * (per - len(win))
+diff -ruN -x __pycache__ orig/crvad_project/crvad/losses.py new/crvad_project/crvad/losses.py
+--- orig/crvad_project/crvad/losses.py	2026-10-12 08:11:35.000000000 +0000
++++ new/crvad_project/crvad/losses.py	2026-10-13 06:46:59.354292530 +0000
+@@ -17,6 +17,8 @@
+ 
+ def flat_index(slot_tuples: torch.Tensor) -> torch.Tensor:
+     """(...,4) slot indices -> (...) flat hypothesis index (matches slots.encode)."""
++    if (slot_tuples < 0).any():
++        raise ValueError("negative slot index (-1 = unknown) reached flat_index; filter such rows first")
+     mult = torch.tensor([S.RADIX[1] * S.RADIX[2] * S.RADIX[3], S.RADIX[2] * S.RADIX[3], S.RADIX[3], 1],
+                         device=slot_tuples.device)
+     return (slot_tuples * mult).sum(-1)
+diff -ruN -x __pycache__ orig/crvad_project/crvad/probes/encoder_bakeoff.py new/crvad_project/crvad/probes/encoder_bakeoff.py
+--- orig/crvad_project/crvad/probes/encoder_bakeoff.py	2026-10-12 15:09:41.000000000 +0000
++++ new/crvad_project/crvad/probes/encoder_bakeoff.py	2026-10-13 06:45:48.730943566 +0000
+@@ -1,23 +1,19 @@
+-"""GATE 2b -- zero-shot encoder bake-off on SSv2 minimal-intervention pairs.
++"""GATE 2 -- zero-shot encoder bake-off on SSv2 minimal-intervention pairs (v2, corrected).
+ 
+-Tests Condition B: can the *video* side see a single-factor change?
++What changed versus v1 (and why the v1 Gate-2 numbers must not be used for decisions)
++  1. PREPROCESSING. v1 normalised CLIP input and then clamp(0,1)-ed it (about half the pixels
++     become 0), and fed X-CLIP raw [0,1] pixels with NO normalisation at all (NORM["xclip"]
++     was defined but never applied). Both are fixed by `normalise`, which never clamps.
++  2. POOLING. v1 took a per-dimension MAX over frames of CLIP features (cached clips then had
++     0.955 mean pairwise cosine and 97% positive entries). Default is now the mean.
++  3. METRIC. v1 pooled accuracy rewards a video-blind classifier that always prefers the caption
++     of the larger class. v2 reports per-pair AUC and balanced accuracy, a clip-level bootstrap
++     CI on the macro AUC, and a within-pair permutation p-value (see metrics.py).
++  4. TEMPORAL ORDER. Zero-shot cosine on a pooled embedding cannot separate order-defined
++     pairs (opening/closing ...). Per-frame features are cached so relation_probe.py can test
++     order-aware probes.
+ 
+-For every clip from template A, ask whether its embedding is closer to A's caption
+-than to A's antonym partner B's caption:
+-
+-    edit_acc = P[ sim(clip, A) > sim(clip, B) ]        chance = 0.50
+-
+-Nothing is trained. If an encoder scores ~0.50 the video representation does not
+-carry the relation and Stage 1 cannot work with it -- whatever happens on the text
+-side. If it scores well above 0.50, that encoder can see relations and Stage 1 is
+-worth running.
+-
+-    python -m crvad.probes.encoder_bakeoff --data runs/ssv2_pairs.pt
+-
+-Also reports:
+-  * multi-class template retrieval accuracy over every matched template (a harder
+-    task than the pairwise one, and directly comparable to published SSv2 numbers)
+-  * a bootstrap CI, because 0.52 vs 0.55 on a few hundred clips is noise
++    python -m crvad.probes.encoder_bakeoff --data runs/ssv2_pairs.pt --encoders clip xclip
+ """
+ from __future__ import annotations
+ 
+@@ -31,27 +27,20 @@
+ import torch
+ import torch.nn.functional as F
+ 
++from .metrics import bootstrap_macro_auc, macro_auc, pair_report, permutation_p
+ from .ssv2_data import ANTONYM_PAIRS
+ 
+-# clip   openai/clip-vit-base-patch16    image tower, max over frames. No temporal
+-#                                       modelling at all -- the control.
+-# xclip  microsoft/xclip-base-patch16   CLIP fine-tuned ON VIDEO, temporal transformer
+-#                                       added. Same family, so clip-vs-xclip isolates
+-#                                       "does video pretraining buy relation
+-#                                       sensitivity?". No extra dependencies.
+-# egovlpv2  egocentric VLP with fusion in the backbone. NOT pip-installable; see
+-#           _load_egovlp for the install note.
++# clip   openai/clip-vit-base-patch16   image tower per frame. No temporal modelling.
++# xclip  microsoft/xclip-base-patch16   CLIP fine-tuned on video, temporal transformer.
++# egovlpv2  NOT pip-installable; see _load_egovlp.
+ HF_IDS = {"clip": "openai/clip-vit-base-patch16", "xclip": "microsoft/xclip-base-patch16"}
+-# Hardcoded rather than read from AutoProcessor: transformers>=5 requires Pillow /
+-# torchvision for the image processor, and these constants are fixed per checkpoint.
+-# NOTE they are NOT the same -- X-CLIP inherits VideoMAE's ImageNet stats, not CLIP's.
+-# Using CLIP's numbers on X-CLIP would silently degrade it and flatter the comparison.
++# Fixed per checkpoint. NOT the same: X-CLIP inherits ImageNet stats, CLIP its own.
+ NORM = {
+     "clip":  ([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+     "xclip": ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+ }
+ EGOVLP = ("egovlpv2", "egovlp")
+-XCLIP_FRAMES = 8          # X-CLIP is trained with 8 frames; our clips have 16
++XCLIP_FRAMES = 8          # X-CLIP is trained with 8 frames
+ 
+ 
+ def _unwrap(out):
+@@ -62,58 +51,73 @@
+     return out
+ 
+ 
++def _prep(clips: torch.Tensor, dev: str, size: int = 224) -> torch.Tensor:
++    """(N,F,3,H,W) uint8 -> (N,F,3,size,size) float in [0,1] (resize only; NOT normalised)."""
++    x = clips.to(dev).float().div_(255.0)
++    b, f = x.shape[:2]
++    x = F.interpolate(x.flatten(0, 1), size=(size, size), mode="bicubic", align_corners=False)
++    return x.view(b, f, 3, size, size).clamp(0, 1)
++
++
++def normalise(x: torch.Tensor, name: str) -> torch.Tensor:
++    """(N,F,3,H,W) in [0,1] -> per-checkpoint mean/std normalised. NEVER clamp afterwards:
++    normalised values legitimately span roughly [-2, 2.6]."""
++    m, s = NORM[name]
++    m = torch.tensor(m, device=x.device, dtype=x.dtype).view(1, 1, 3, 1, 1)
++    s = torch.tensor(s, device=x.device, dtype=x.dtype).view(1, 1, 3, 1, 1)
++    return (x - m) / s
++
++
+ # --------------------------------------------------------------------------- encoders
+-def encode_clip(name: str, clips: torch.Tensor, dev: str, batch: int = 32):
+-    """(N,F,3,H,W) uint8 -> (N,D) L2-normalised."""
+-    if name in HF_IDS:
+-        from transformers import AutoModel, AutoProcessor
++def encode_frames(name: str, clips: torch.Tensor, dev: str, batch: int = 32) -> torch.Tensor:
++    """(N,F,3,H,W) uint8 -> (N,T,D) L2-normalised. CLIP: one vector per frame (T=F).
++    X-CLIP / EgoVLP: one video-level vector (T=1)."""
++    if name == "clip":
++        from transformers import AutoModel
+ 
+-        mid = HF_IDS[name]
+-        model = AutoModel.from_pretrained(mid, torch_dtype=torch.float32).to(dev).eval()
++        model = AutoModel.from_pretrained(HF_IDS[name], torch_dtype=torch.float32).to(dev).eval()
+         outs = []
+         with torch.no_grad():
+-            if name == "xclip":
+-                k = min(XCLIP_FRAMES, clips.shape[1])
+-                sel = torch.linspace(0, clips.shape[1] - 1, k).round().long()
+-                for i in range(0, len(clips), batch):
+-                    x = _prep(clips[i : i + batch][:, sel], dev)
+-                    outs.append(F.normalize(_unwrap(model.get_video_features(
+-                        pixel_values=x)).float(), dim=-1))
+-            else:
+-                mean, std = _norm_stats(name, dev)
+-                for i in range(0, len(clips), batch):
+-                    chunk = clips[i : i + batch].to(dev).float().div_(255.0)
+-                    b, f = chunk.shape[:2]
+-                    x = F.interpolate(chunk.flatten(0, 1), size=(224, 224),
+-                                      mode="bicubic", align_corners=False)
+-                    x = ((x.view(b, f, 3, 224, 224) - mean) / std).clamp(0, 1)
+-                    feat = F.normalize(_unwrap(
+-                        model.get_image_features(pixel_values=x.flatten(0, 1))).float(), dim=-1)
+-                    # (B*F, D) -> (B, F, D). Two -1s is illegal, torch infers only one.
+-                    outs.append(F.normalize(feat.view(b, f, -1).max(dim=1).values, dim=-1))
++            for i in range(0, len(clips), batch):
++                x = normalise(_prep(clips[i : i + batch], dev), "clip")
++                b, f = x.shape[:2]
++                feat = F.normalize(_unwrap(model.get_image_features(pixel_values=x.flatten(0, 1))).float(), dim=-1)
++                outs.append(feat.view(b, f, -1).cpu())
+         del model
+         if dev.startswith("cuda"):
+             torch.cuda.empty_cache()
+         return torch.cat(outs)
+ 
++    if name == "xclip":
++        from transformers import AutoModel
++
++        model = AutoModel.from_pretrained(HF_IDS[name], torch_dtype=torch.float32).to(dev).eval()
++        k = min(XCLIP_FRAMES, clips.shape[1])
++        sel = torch.linspace(0, clips.shape[1] - 1, k).round().long()
++        outs = []
++        with torch.no_grad():
++            for i in range(0, len(clips), batch):
++                x = normalise(_prep(clips[i : i + batch][:, sel], dev), "xclip")   # <- v1 skipped this
++                outs.append(F.normalize(_unwrap(model.get_video_features(pixel_values=x)).float(), dim=-1).cpu())
++        del model
++        if dev.startswith("cuda"):
++            torch.cuda.empty_cache()
++        return torch.cat(outs).unsqueeze(1)
++
+     if name in EGOVLP:
+-        return _encode_egovlp(clips, dev, batch)
++        return _encode_egovlp(clips, dev, batch).cpu().unsqueeze(1)
+ 
+     raise ValueError(f"unknown encoder {name!r}")
+ 
+ 
+-def _prep(clips: torch.Tensor, dev: str, size: int = 224):
+-    """(N,F,3,H,W) uint8 -> (N,F,3,size,size) float in [0,1]."""
+-    x = clips.to(dev).float().div_(255.0)
+-    b, f = x.shape[:2]
+-    x = F.interpolate(x.flatten(0, 1), size=(size, size), mode="bicubic", align_corners=False)
+-    return x.view(b, f, 3, size, size).clamp(0, 1)
++def pool_frames(Fr: torch.Tensor, pool: str = "mean") -> torch.Tensor:
++    """(N,T,D) -> (N,D) normalised. Mean is the standard choice; 'max' is kept only to reproduce v1."""
++    p = Fr.mean(1) if pool == "mean" else Fr.max(1).values
++    return F.normalize(p, dim=-1)
+ 
+ 
+-def _norm_stats(name: str, dev: str):
+-    m, s = NORM[name]
+-    return (torch.tensor(m, device=dev).view(1, 1, 3, 1, 1),
+-            torch.tensor(s, device=dev).view(1, 1, 3, 1, 1))
++def encode_clip(name: str, clips: torch.Tensor, dev: str, batch: int = 32, pool: str = "mean") -> torch.Tensor:
++    return pool_frames(encode_frames(name, clips, dev, batch), pool)
+ 
+ 
+ def encode_text(name: str, sentences: List[str], dev: str) -> torch.Tensor:
+@@ -129,14 +133,13 @@
+         del model
+         if dev.startswith("cuda"):
+             torch.cuda.empty_cache()
+-        return out
+-
++        return out.cpu()
+     if name in EGOVLP:
+-        return _egovlp_text(sentences, dev)
+-
++        return _egovlp_text(sentences, dev).cpu()
+     raise ValueError(f"unknown encoder {name!r}")
+ 
+ 
++
+ _EG = {}
+ 
+ 
+@@ -217,99 +220,93 @@
+         return F.normalize(m.encode_text(list(sentences)).float(), dim=-1)
+ 
+ 
+-# --------------------------------------------------------------------------- eval
+-def bootstrap_ci(x: torch.Tensor, n: int = 2000, seed: int = 0) -> tuple:
+-    g = torch.Generator().manual_seed(seed)
+-    idx = torch.randint(0, len(x), (n, len(x)), generator=g)
+-    means = x[idx].mean(dim=1)
+-    return means.quantile(0.025).item(), means.quantile(0.975).item()
+-
+ 
+-def evaluate(data, encoder: str, dev: str) -> Dict:
+-    clips, labels, captions = data["clips"], data["label"], data["captions"]
++# --------------------------------------------------------------------------- eval
++def build_pairs(V: torch.Tensor, U: torch.Tensor, labels: torch.Tensor, captions) -> List[dict]:
++    """Per antonym pair: s = sim(clip,A) - sim(clip,B) for the clips of each template."""
+     gid = {c: i for i, c in enumerate(captions)}
+-
+-    V = encode_clip(encoder, clips, dev)
+-    Uall = encode_text(encoder, list(captions), dev)
+-
+-    # Pairwise discrimination: for each (A,B), clips of A must prefer A's caption and
+-    # clips of B must prefer B's. Both directions pooled so an unbalanced pair cannot
+-    # score well by having more clips on one side.
+-    per_pair = {}
+-    obs: List[float] = []                      # one entry per (clip, pair) test
++    pairs = []
+     for a, b in ANTONYM_PAIRS:
+         if a not in gid or b not in gid:
+             continue
+-        ua, ub = Uall[gid[a]], Uall[gid[b]]
+-        ma, mb = labels == gid[a], labels == gid[b]
+-        if not ma.any() or not mb.any():
++        ia, ib = (labels == gid[a]).nonzero().flatten(), (labels == gid[b]).nonzero().flatten()
++        if len(ia) == 0 or len(ib) == 0:
+             continue
+-        ca = ((V[ma] * ua).sum(-1) > (V[ma] * ub).sum(-1)).float()
+-        cb = ((V[mb] * ub).sum(-1) > (V[mb] * ua).sum(-1)).float()
+-        obs += ca.tolist() + cb.tolist()       # both directions, so imbalance cannot help
+-        n_a, n_b = int(ma.sum()), int(mb.sum())
+-        pair_acc = (ca.sum().item() + cb.sum().item()) / (n_a + n_b)
+-        margin = (((V[ma] * ua).sum(-1) - (V[ma] * ub).sum(-1)).mean().item()
+-                  + ((V[mb] * ub).sum(-1) - (V[mb] * ua).sum(-1)).mean().item()) / 2
+-        per_pair[f"{a}  vs  {b}"] = {"edit_acc": pair_acc, "margin": margin,
+-                                     "n_a": n_a, "n_b": n_b}
+-
+-    correct = torch.tensor(obs) if obs else torch.tensor([float("nan")])
+-    lo, hi = bootstrap_ci(correct)
+-    retrieval = (V @ Uall.T).argmax(1) == labels
++        s = V @ (U[gid[a]] - U[gid[b]])
++        pairs.append({"name": f"{a}  vs  {b}", "ta": gid[a], "tb": gid[b], "sA": s[ia], "sB": s[ib]})
++    return pairs
++
+ 
++def summarise(pairs: List[dict], n_boot: int = 2000, n_perm: int = 2000) -> Dict:
++    per_pair = {p["name"]: pair_report(p["sA"], p["sB"]) for p in pairs}
++    lo, hi = bootstrap_macro_auc(pairs, n_boot)
+     return {
+-        "encoder": encoder,
+-        "n_clips": int(len(clips)),
+-        "n_templates": len(captions),
+-        "n_pairs": len(per_pair),
+-        "n_observations": len(obs),
+-        "edit_acc": correct.mean().item(),
+-        "edit_acc_ci95": [lo, hi],
+-        "template_retrieval": retrieval.float().mean().item(),
+-        "retrieval_chance": 1.0 / len(captions),
++        "n_pairs": len(pairs),
++        "macro_auc": macro_auc(pairs),
++        "macro_auc_ci95": [lo, hi],
++        "perm_p": permutation_p(pairs, n_perm),
++        "macro_acc_balanced": sum(r["acc_balanced"] for r in per_pair.values()) / max(1, len(per_pair)),
++        "pooled_acc_raw_v1_style": sum(r["acc_raw"] * (r["n_a"] + r["n_b"]) for r in per_pair.values())
++                                   / max(1, sum(r["n_a"] + r["n_b"] for r in per_pair.values())),
++        "n_constant_preference_pairs": sum(r["constant_preference"] for r in per_pair.values()),
+         "per_pair": per_pair,
+     }
+ 
+ 
++def evaluate(data, encoder: str, dev: str, pool: str = "mean") -> Dict:
++    clips, labels, captions = data["clips"], data["label"], data["captions"]
++    V = encode_clip(encoder, clips, dev, pool=pool)
++    U = encode_text(encoder, list(captions), dev)
++    r = summarise(build_pairs(V, U, labels, captions))
++    r.update(encoder=encoder, pool=pool, n_clips=int(len(clips)), n_templates=len(captions),
++             template_retrieval=((V @ U.T).argmax(1) == labels).float().mean().item(),
++             retrieval_chance=1.0 / len(captions))
++    return r
++
++
++def verdict(r: Dict) -> str:
++    lo = r["macro_auc_ci95"][0]
++    if lo > 0.55 and r["perm_p"] < 0.05:
++        return "SIGNAL -- zero-shot text-conditioned relation sensitivity above chance"
++    if r["perm_p"] < 0.05:
++        return "WEAK SIGNAL -- above chance, CI too wide or too low to rely on"
++    return "NO ZERO-SHOT SIGNAL (says little: pooled zero-shot cannot see order; run relation_probe)"
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--data", default="runs/ssv2_pairs.pt")
+     ap.add_argument("--encoders", nargs="*", default=["clip", "xclip"])
++    ap.add_argument("--pool", choices=["mean", "max"], default="mean")
+     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+-    ap.add_argument("--out", default="runs/gate2_encoder_bakeoff.json")
++    ap.add_argument("--out", default="runs/gate2_encoder_bakeoff_v2.json")
+     a = ap.parse_args()
+ 
+     data = torch.load(a.data, weights_only=False)
+-    print(f"{data['clips'].shape[0]} clips x {data['clips'].shape[1]} frames, "
+-          f"{len(data['captions'])} template pairs\n")
+-
++    print(f"{data['clips'].shape[0]} clips x {data['clips'].shape[1]} frames, {len(data['captions'])} templates\n")
+     results = {}
+     for enc in a.encoders:
+         print(f"===== {enc} " + "=" * (60 - len(enc)))
+         try:
+-            r = evaluate(data, enc, a.device)
+-        except Exception as e:                       # missing package, OOM, AV1, ...
++            r = evaluate(data, enc, a.device, a.pool)
++        except Exception as e:
+             print(f"  SKIPPED: {type(e).__name__}: {e}\n")
+             continue
+         results[enc] = r
+-        verdict = ("DEAD  -- video features do not carry the relation"
+-                   if r["edit_acc_ci95"][1] < 0.60 else
+-                   "WEAK  -- barely above chance" if r["edit_acc"] < 0.65 else
+-                   "OK    -- encoder can see single-factor changes")
+-        print(f"  edit_acc (pairwise)   : {r['edit_acc']:.3f}   95% CI [{r['edit_acc_ci95'][0]:.3f}, {r['edit_acc_ci95'][1]:.3f}]"
+-              f"   ({r['n_pairs']} pairs, {r['n_observations']} tests)")
+-        print(f"  template retrieval    : {r['template_retrieval']:.3f}   (chance {r['retrieval_chance']:.3f})")
+-        print(f"  -> {verdict}\n")
+-        for t, v in sorted(r["per_pair"].items(), key=lambda kv: kv[1]["edit_acc"]):
+-            print(f"    {v['edit_acc']:.3f}  (margin {v['margin']:+.4f}, n={v['n_a']}+{v['n_b']})  {t}")
+-
++        print(f"  macro AUC (bias-invariant): {r['macro_auc']:.3f}  95% CI [{r['macro_auc_ci95'][0]:.3f}, "
++              f"{r['macro_auc_ci95'][1]:.3f}]  perm p={r['perm_p']:.3f}  ({r['n_pairs']} pairs)")
++        print(f"  macro balanced acc: {r['macro_acc_balanced']:.3f}   v1-style pooled acc: {r['pooled_acc_raw_v1_style']:.3f}"
++              f"   constant-preference pairs: {r['n_constant_preference_pairs']}/{r['n_pairs']}")
++        print(f"  template retrieval: {r['template_retrieval']:.3f} (chance {r['retrieval_chance']:.3f})")
++        print(f"  -> {verdict(r)}\n")
++        for t, v in sorted(r["per_pair"].items(), key=lambda kv: kv[1]["auc"]):
++            flag = " [const]" if v["constant_preference"] else ""
++            print(f"    AUC {v['auc']:.3f} balAcc {v['acc_balanced']:.3f} (n={v['n_a']}+{v['n_b']}){flag}  {t}")
+     if results:
+-        import os
+         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+         json.dump(results, open(a.out, "w"), indent=2)
+         print(f"\nwrote {a.out}")
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff -ruN -x __pycache__ orig/crvad_project/crvad/probes/linear_probe.py new/crvad_project/crvad/probes/linear_probe.py
+--- orig/crvad_project/crvad/probes/linear_probe.py	2026-10-12 16:31:59.000000000 +0000
++++ new/crvad_project/crvad/probes/linear_probe.py	2026-10-13 06:46:23.964952332 +0000
+@@ -1,128 +1,67 @@
+-"""Linear probe: is the relation information PRESENT in the frozen features?
++"""GATE 2b (v2) -- is the relation linearly decodable from frozen per-frame features?
+ 
+-Zero-shot cosine (encoder_bakeoff.py) measures prompt sensitivity, not information
+-content. A frozen encoder can score near chance zero-shot and still contain a
+-perfectly linearly-decodable relation -- which is exactly the situation the temporal
+-adapter in crvad/model.py exists to exploit.
+-
+-So: extract features once, cache them, then ask the question the zero-shot number
+-cannot answer.
+-
+-    python -m crvad.probes.linear_probe --encoders clip xclip
+-
+-Reports, per encoder:
+-  * zero-shot pairwise edit_acc   (from the cached features)
+-  * cross-validated 41-way template accuracy
+-  * the same on shuffled labels   (a permutation control -- a probe that cannot
+-    beat its own control is fitting noise, not signal)
++v1 fit a 26-way template classifier on POOLED, UNSTANDARDISED features with 217 samples and
++read "below chance" as "no signal". Below-chance accuracy is what leave-few-out CV produces on
++pure noise, and the pooled input is order-blind, so directional pairs were unsolvable by design.
++
++v2 asks the binary question the thesis actually needs, once per antonym pair, on features that
++keep temporal order:
++
++    mean           mean over frames                      (order-blind control)
++    halves         [mean(first half), mean(second half)] (order-aware)
++    delta          [mean, second - first]                (order-aware)
++    halves_shuf    'halves' after shuffling frame order  (must collapse to ~'mean' for directional pairs)
++
++Reported: macro AUC over pairs, a within-pair label-permutation null (mean, 95th pct, p-value).
++Reading it:
++  * halves >> mean on directional pairs  => the encoder keeps temporal relation information
++  * halves ~ mean ~ 0.5                  => features do not carry it (try a video-native encoder)
++  * mean > 0.5 on directional pairs      => appearance leak (object/scene differs between templates)
++
++    python -m crvad.probes.linear_probe --encoders clip --data runs/ssv2_pairs.pt
++Needs >= ~15 clips per template per pair to be meaningful; pairs with < 3 clips are skipped.
+ """
+ from __future__ import annotations
+ 
+ import argparse
+ import json
+ import os
+-from typing import Dict, Tuple
++from typing import Dict, List
+ 
+ import torch
+-import torch.nn.functional as F
+ 
++from .relation_probe import probe_macro, variants
+ from .ssv2_data import ANTONYM_PAIRS
+ 
+ CACHE = "runs/feats"
+ 
+ 
+-# --------------------------------------------------------------------------- features
+-def get_feats(encoder: str, data, dev: str, batch: int = 32) -> torch.Tensor:
+-    """Encoded clips (N,D), cached on disk. Encoding is the expensive part (~25 min on
+-    CPU for 264 clips); everything downstream is seconds, so cache aggressively."""
++def get_frame_feats(encoder: str, data, dev: str, batch: int = 32) -> torch.Tensor:
++    """(N,T,D) per-frame features, cached. The cache stores the labels it was built for and is
++    discarded if they differ (a stale cache silently attached to new labels is a classic bug)."""
+     os.makedirs(CACHE, exist_ok=True)
+-    tag = f"{encoder}_{data['clips'].shape[0]}x{data['clips'].shape[1]}"
+-    path = os.path.join(CACHE, f"{tag}.pt")
++    path = os.path.join(CACHE, f"{encoder}_frames_{data['clips'].shape[0]}x{data['clips'].shape[1]}.pt")
+     if os.path.exists(path):
+-        print(f"  [{encoder}] cached {path}")
+-        return torch.load(path, weights_only=False)
+-
+-    from .encoder_bakeoff import encode_clip
++        c = torch.load(path, weights_only=True)
++        if torch.equal(c["label"], data["label"]):
++            print(f"  [{encoder}] cached {path}")
++            return c["F"].float()
++        print(f"  [{encoder}] cache labels differ from data -> re-encoding")
++    from .encoder_bakeoff import encode_frames
++
++    print(f"  [{encoder}] encoding {len(data['clips'])} clips ...")
++    Fr = encode_frames(encoder, data["clips"], dev, batch).cpu()
++    torch.save({"F": Fr.half(), "label": data["label"]}, path)
++    return Fr.float()
+ 
+-    print(f"  [{encoder}] encoding {len(data['clips'])} clips (slow, cached afterwards) ...")
+-    V = encode_clip(encoder, data["clips"], dev, batch).cpu()
+-    torch.save(V, path)
+-    print(f"  [{encoder}] saved {tuple(V.shape)} -> {path}")
+-    return V
+-
+-
+-# --------------------------------------------------------------------------- probes
+-def logreg(X: torch.Tensor, y: torch.Tensor, n_cls: int, epochs: int = 300,
+-           lr: float = 0.05, wd: float = 1e-3, seed: int = 0):
+-    """Fit multinomial logistic regression, full-batch AdamW. n is tiny here
+-    (hundreds), so anything fancier is overkill and slower.
+-
+-    Returns (W, b) so the caller can score a DIFFERENT (held-out) set -- returning
+-    logits would silently tie the fit to the training fold."""
+-    torch.manual_seed(seed)
+-    W = torch.zeros(X.shape[1], n_cls, requires_grad=True)
+-    b = torch.zeros(n_cls, requires_grad=True)
+-    opt = torch.optim.AdamW([W, b], lr=lr, weight_decay=wd)
+-    for _ in range(epochs):
+-        opt.zero_grad()
+-        F.cross_entropy(X @ W + b, y).backward()
+-        opt.step()
+-    return W.detach(), b.detach()
+-
+-
+-def cv_probe(X: torch.Tensor, y: torch.Tensor, n_cls: int, folds: int = 5,
+-             seed: int = 0, shuffle_y: bool = False) -> Dict[str, float]:
+-    """Stratified k-fold. Classes with fewer than `folds` members are dropped from the
+-    accuracy but kept in training, otherwise a template with 1 clip breaks the split."""
+-    g = torch.Generator().manual_seed(seed)
+-    if shuffle_y:                      # permutation control
+-        y = y[torch.randperm(len(y), generator=g)]
+-
+-    counts = torch.bincount(y, minlength=n_cls)
+-    keep = y[counts[y] >= folds]
+-    yk = keep
+-    Xk = X[(y.unsqueeze(1) == keep.unsqueeze(0)).any(1)]
+-    usable = torch.unique(yk)
+-    remap = -torch.ones(n_cls, dtype=torch.long)
+-    remap[usable] = torch.arange(len(usable))
+-    yk = remap[yk]
+-
+-    # stratified fold assignment
+-    fold = torch.zeros(len(yk), dtype=torch.long)
+-    for c in usable.tolist():
+-        idx = (yk == c).nonzero().flatten()
+-        idx = idx[torch.randperm(len(idx), generator=g)]
+-        fold[idx] = torch.arange(len(idx)) % folds
+-
+-    correct, n = 0, 0
+-    for k in range(folds):
+-        tr, te = fold != k, fold == k
+-        if not te.any() or not tr.any():
+-            continue
+-        # Fit on the training folds, then SCORE the held-out fold. Applying the
+-        # training-fold logits to the test mask would be a shape error at best and
+-        # a silently mis-folded split at worst.
+-        W, b = logreg(Xk[tr], yk[tr], len(usable), seed=seed + k)
+-        logits = Xk[te] @ W + b
+-        correct += int((logits.argmax(1) == yk[te]).sum())
+-        n += int(te.sum())
+-    return {"acc": correct / max(1, n), "n": n, "n_classes": len(usable),
+-            "chance": 1.0 / max(1, len(usable))}
+ 
+-
+-def zeroshot(V: torch.Tensor, U: torch.Tensor, captions, labels: torch.Tensor) -> float:
++def pair_feature_sets(X: torch.Tensor, labels: torch.Tensor, captions) -> List[Dict[str, torch.Tensor]]:
+     gid = {c: i for i, c in enumerate(captions)}
+-    s = V @ U.T
+-    hits = tot = 0
++    out = []
+     for a, b in ANTONYM_PAIRS:
+-        if a not in gid or b not in gid:
+-            continue
+-        ma, mb = labels == gid[a], labels == gid[b]
+-        if not ma.any() or not mb.any():
+-            continue
+-        hits += int((s[ma, gid[a]] > s[ma, gid[b]]).sum()) + int((s[mb, gid[b]] > s[mb, gid[a]]).sum())
+-        tot += int(ma.sum()) + int(mb.sum())
+-    return hits / max(1, tot)
++        if a in gid and b in gid:
++            out.append({"name": f"{a} vs {b}", "A": X[labels == gid[a]], "B": X[labels == gid[b]]})
++    return out
+ 
+ 
+ def main():
+@@ -130,46 +69,36 @@
+     ap.add_argument("--data", default="runs/ssv2_pairs.pt")
+     ap.add_argument("--encoders", nargs="*", default=["clip", "xclip"])
+     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+-    ap.add_argument("--folds", type=int, default=5)
+-    ap.add_argument("--out", default="runs/gate2_linear_probe.json")
++    ap.add_argument("--n-perm", type=int, default=200)
++    ap.add_argument("--out", default="runs/gate2_relation_probe_v2.json")
+     a = ap.parse_args()
+ 
+     data = torch.load(a.data, weights_only=False)
+-    clips, labels, captions = data["clips"], data["label"], data["captions"]
+-    print(f"{len(clips)} clips, {len(captions)} templates, folds={a.folds}\n")
+-
++    labels, captions = data["label"], data["captions"]
++    print(f"{len(labels)} clips, {len(captions)} templates\n")
+     results: Dict[str, Dict] = {}
+     for enc in a.encoders:
+         print(f"===== {enc} " + "=" * (54 - len(enc)))
+         try:
+-            V = get_feats(enc, data, a.device)
+-            from .encoder_bakeoff import encode_text
+-
+-            U = encode_text(enc, list(captions), a.device).cpu()
++            Fr = get_frame_feats(enc, data, a.device)
+         except Exception as e:
+             print(f"  SKIPPED: {type(e).__name__}: {e}\n")
+             continue
+-
+-        n_cls = len(captions)
+-        zs = zeroshot(V, U, captions, labels)
+-        real = cv_probe(V, labels, n_cls, a.folds, shuffle_y=False)
+-        ctrl = cv_probe(V, labels, n_cls, a.folds, shuffle_y=True)
+-
+-        print(f"  zero-shot pairwise edit_acc : {zs:.3f}          (chance 0.500)")
+-        print(f"  linear probe (real labels)  : {real['acc']:.3f}          "
+-              f"(chance {real['chance']:.3f}, n={real['n']}, {real['n_classes']} classes)")
+-        print(f"  linear probe (SHUFFLED)    : {ctrl['acc']:.3f}          <- permutation control")
+-        gain = real["acc"] - ctrl["acc"]
+-        verdict = ("INFORMATION PRESENT -- linearly decodable, Stage 1 is viable" if gain > 0.05
+-                   else "NO USABLE SIGNAL -- probe cannot beat its own control")
+-        print(f"  gain over control          : {gain:+.3f}   -> {verdict}\n")
+-
+-        results[enc] = {"zeroshot_edit_acc": zs, "probe_acc": real["acc"],
+-                        "probe_chance": real["chance"], "probe_n": real["n"],
+-                        "probe_n_classes": real["n_classes"],
+-                        "control_acc": ctrl["acc"], "gain_over_control": gain,
+-                        "verdict": verdict}
+-
++        vs = variants(Fr)
++        if Fr.shape[1] >= 2:                       # order-destroyed control
++            g = torch.Generator().manual_seed(0)
++            perm = torch.stack([torch.randperm(Fr.shape[1], generator=g) for _ in range(len(Fr))])
++            vs["halves_shuf"] = variants(torch.gather(Fr, 1, perm[..., None].expand_as(Fr)))["halves"]
++        results[enc] = {}
++        for name, X in vs.items():
++            r = probe_macro(pair_feature_sets(X, labels, captions), n_perm=a.n_perm)
++            results[enc][name] = r
++            if r.get("n_pairs", 0):
++                print(f"  {name:12s} macro AUC {r['macro_auc']:.3f}  null {r['null_mean']:.3f} "
++                      f"(p95 {r['null_p95']:.3f})  p={r['p_value']:.3f}  ({r['n_pairs']} pairs)")
++            else:
++                print(f"  {name:12s} no usable pairs (need >=3 clips per template)")
++        print()
+     if results:
+         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+         json.dump(results, open(a.out, "w"), indent=2)
+@@ -177,4 +106,4 @@
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff -ruN -x __pycache__ orig/crvad_project/crvad/probes/metrics.py new/crvad_project/crvad/probes/metrics.py
+--- orig/crvad_project/crvad/probes/metrics.py	1970-01-01 00:00:00.000000000 +0000
++++ new/crvad_project/crvad/probes/metrics.py	2026-10-13 06:44:57.557012446 +0000
+@@ -0,0 +1,83 @@
++"""Bias-invariant metrics for minimal-pair probes (pure torch; no model dependencies).
++
++Why this file exists
++--------------------
++The original pooled `edit_acc` pools the clips of template A (should prefer caption A) and the
++clips of template B (should prefer caption B) and reports one accuracy. That is NOT immune to
++class imbalance: a classifier that ignores the video and always prefers caption A scores
++n_A / (n_A + n_B). In the first Gate-2 run, 12/22 (CLIP) and 13/22 (X-CLIP) pairs had a number
++correct exactly equal to one template's clip count, which is that signature.
++
++For a pair (A, B) define, per clip,   s = sim(clip, A) - sim(clip, B).
++A-clips should have large s, B-clips small s. Then
++  * AUC          = P(s_A > s_B)           invariant to any constant caption preference
++  * balanced_acc = mean(0.5*(s_A>0) + 0.5*(s_B<0))   what the zero-shot decision rule really achieves
++  * margin       = (mean s_A - mean s_B)/2   bias-cancelled separation
++A video-blind classifier gets AUC 0.5 and balanced_acc 0.5 whatever the class sizes.
++"""
++from __future__ import annotations
++
++from typing import Dict, List, Sequence, Tuple
++
++import torch
++
++
++def pair_auc(sA: torch.Tensor, sB: torch.Tensor) -> float:
++    d = sA.reshape(-1, 1) - sB.reshape(1, -1)
++    return ((d > 0).float().mean() + 0.5 * (d == 0).float().mean()).item()
++
++
++def pair_report(sA: torch.Tensor, sB: torch.Tensor) -> Dict[str, float]:
++    na, nb = len(sA), len(sB)
++    raw_correct = int((sA > 0).sum()) + int((sB < 0).sum())
++    return {
++        "n_a": na, "n_b": nb,
++        "auc": pair_auc(sA, sB),
++        "acc_raw": raw_correct / (na + nb),
++        "acc_balanced": 0.5 * ((sA > 0).float().mean().item() + (sB < 0).float().mean().item()),
++        "majority_share": max(na, nb) / (na + nb),
++        "pref_A": ((sA > 0).sum().item() + (sB > 0).sum().item()) / (na + nb),
++        "margin": 0.5 * (sA.mean().item() - sB.mean().item()),
++        # "video-blind" signature: the number correct equals one class size
++        "constant_preference": raw_correct in (na, nb),
++    }
++
++
++def macro(values: Sequence[float]) -> float:
++    return sum(values) / max(1, len(values))
++
++
++def macro_auc(pairs: List[dict]) -> float:
++    return macro([pair_auc(p["sA"], p["sB"]) for p in pairs])
++
++
++def bootstrap_macro_auc(pairs: List[dict], n_boot: int = 2000, seed: int = 0) -> Tuple[float, float]:
++    """Clip-level bootstrap. Clips are resampled WITHIN each template and the same resample is
++    applied to every pair that uses that template (templates are reused across pairs), so shared
++    clips are never treated as independent. Each pair dict needs: ta, tb, sA, sB (sA ordered by
++    the clips of template ta, sB by the clips of tb, consistently across pairs)."""
++    g = torch.Generator().manual_seed(seed)
++    sizes: Dict[int, int] = {}
++    for p in pairs:
++        sizes[p["ta"]] = len(p["sA"]); sizes[p["tb"]] = len(p["sB"])
++    vals = []
++    for _ in range(n_boot):
++        pos = {t: torch.randint(0, n, (n,), generator=g) for t, n in sizes.items()}
++        vals.append(macro([pair_auc(p["sA"][pos[p["ta"]]], p["sB"][pos[p["tb"]]]) for p in pairs]))
++    v = torch.tensor(vals)
++    return v.quantile(0.025).item(), v.quantile(0.975).item()
++
++
++def permutation_p(pairs: List[dict], n_perm: int = 2000, seed: int = 0) -> float:
++    """One-sided P(macro AUC under within-pair label shuffling >= observed)."""
++    g = torch.Generator().manual_seed(seed)
++    obs = macro_auc(pairs)
++    ge = 0
++    for _ in range(n_perm):
++        vals = []
++        for p in pairs:
++            s = torch.cat([p["sA"], p["sB"]])
++            pm = torch.randperm(len(s), generator=g)
++            vals.append(pair_auc(s[pm[: len(p["sA"])]], s[pm[len(p["sA"]):]]))
++        ge += macro(vals) >= obs - 1e-12
++    return (1 + ge) / (1 + n_perm)
+diff -ruN -x __pycache__ orig/crvad_project/crvad/probes/relation_probe.py new/crvad_project/crvad/probes/relation_probe.py
+--- orig/crvad_project/crvad/probes/relation_probe.py	1970-01-01 00:00:00.000000000 +0000
++++ new/crvad_project/crvad/probes/relation_probe.py	2026-10-13 06:44:57.558529642 +0000
+@@ -0,0 +1,92 @@
++"""Standardised ridge probes for minimal pairs, temporal-order aware.
++
++Fixes versus the first linear_probe.py
++  * features are z-scored with TRAINING-fold statistics (CLIP clip features have per-dim std
++    ~0.009 and 0.955 mean pairwise cosine, the worst case for an unstandardised optimiser);
++  * closed-form ridge with the penalty chosen by exact leave-one-out (no epochs/lr to tune);
++  * the question is binary per antonym pair (is it A or B?), scored by AUC, not 26-way template
++    accuracy (which is dominated by object/scene cues, not the relation);
++  * features keep temporal order: 'mean' is order-blind BY CONSTRUCTION, so directional pairs
++    (opening/closing, up/down, into/out of, covering/uncovering, folding/unfolding) cannot be
++    solved from it. 'halves' and 'delta' expose order. A model that scores the same on
++    'mean' and 'halves' for directional pairs is using appearance, not the relation.
++"""
++from __future__ import annotations
++
++from typing import Dict, List, Sequence
++
++import torch
++
++from .metrics import macro, pair_auc
++
++
++def variants(F: torch.Tensor) -> Dict[str, torch.Tensor]:
++    """F: (N,T,D) per-frame/segment features -> {name: (N,d)} probe inputs."""
++    out = {"mean": F.mean(1)}
++    if F.shape[1] >= 2:
++        h = F.shape[1] // 2
++        a, b = F[:, :h].mean(1), F[:, h:].mean(1)
++        out["halves"] = torch.cat([a, b], dim=1)
++        out["delta"] = torch.cat([F.mean(1), b - a], dim=1)
++    return out
++
++
++def ridge_fit_predict(Xtr: torch.Tensor, ytr: torch.Tensor, Xte: torch.Tensor,
++                      lam_scales: Sequence[float] = (0.01, 0.1, 1.0, 10.0, 100.0)) -> torch.Tensor:
++    mu, sd = Xtr.mean(0), Xtr.std(0).clamp(min=1e-6)
++    A, B = (Xtr - mu) / sd, (Xte - mu) / sd
++    ym = ytr.mean()
++    yc = ytr - ym
++    K = A @ A.T
++    n = K.shape[0]
++    eye = torch.eye(n, dtype=K.dtype)
++    base = K.diag().mean()
++    best, lam = None, lam_scales[0] * base
++    for s in lam_scales:                                    # exact LOO for ridge: e_i / (1 - h_ii)
++        H = K @ torch.linalg.inv(K + s * base * eye)
++        err = (((yc - H @ yc) / (1 - H.diag()).clamp(min=1e-6)) ** 2).mean().item()
++        if best is None or err < best:
++            best, lam = err, s * base
++    alpha = torch.linalg.solve(K + lam * eye, yc)
++    return B @ (A.T @ alpha) + ym
++
++
++def cv_pair_auc(XA: torch.Tensor, XB: torch.Tensor, folds: int = 5, repeats: int = 3, seed: int = 0,
++                shuffle: bool = False) -> float:
++    """Repeated stratified CV AUC of a ridge probe separating template A from B."""
++    X = torch.cat([XA, XB]).double()
++    y = torch.cat([torch.ones(len(XA)), -torch.ones(len(XB))]).double()
++    g = torch.Generator().manual_seed(seed)
++    if shuffle:
++        y = y[torch.randperm(len(y), generator=g)]
++    k = min(folds, int((y > 0).sum()), int((y < 0).sum()))
++    if k < 2:
++        return float("nan")
++    aucs = []
++    for _ in range(repeats):
++        fold = torch.zeros(len(y), dtype=torch.long)
++        for cls in (1.0, -1.0):
++            idx = (y == cls).nonzero().flatten()
++            idx = idx[torch.randperm(len(idx), generator=g)]
++            fold[idx] = torch.arange(len(idx)) % k
++        oof = torch.zeros(len(y), dtype=torch.double)
++        for f in range(k):
++            te = fold == f
++            oof[te] = ridge_fit_predict(X[~te], y[~te], X[te])
++        aucs.append(pair_auc(oof[y > 0], oof[y < 0]))
++    return macro(aucs)
++
++
++def probe_macro(pair_feats: List[Dict[str, torch.Tensor]], n_perm: int = 200, seed: int = 0) -> Dict[str, float]:
++    """pair_feats: [{'A': (nA,d), 'B': (nB,d)}, ...]. Returns macro AUC, permutation mean and one-sided p.
++    Pairs with fewer than 3 clips in either class are skipped (reported via n_pairs)."""
++    use = [p for p in pair_feats if len(p["A"]) >= 3 and len(p["B"]) >= 3]
++    if not use:
++        return {"n_pairs": 0}
++    obs = macro([cv_pair_auc(p["A"], p["B"], seed=seed) for p in use])
++    null = []
++    for i in range(n_perm):
++        null.append(macro([cv_pair_auc(p["A"], p["B"], repeats=1, seed=seed + 1000 + i, shuffle=True) for p in use]))
++    nt = torch.tensor(null)
++    return {"n_pairs": len(use), "macro_auc": obs, "null_mean": nt.mean().item(),
++            "null_p95": nt.quantile(0.95).item(), "p_value": (1 + int((nt >= obs).sum())) / (1 + n_perm)}
+diff -ruN -x __pycache__ orig/crvad_project/crvad/pseudo_label.py new/crvad_project/crvad/pseudo_label.py
+--- orig/crvad_project/crvad/pseudo_label.py	2026-10-12 08:11:35.000000000 +0000
++++ new/crvad_project/crvad/pseudo_label.py	2026-10-13 06:47:47.981328480 +0000
+@@ -33,12 +33,17 @@
+ 
+ def parse_response(text: str) -> Optional[Dict[str, Optional[int]]]:
+     """Extract the first JSON object and map values to schema indices (None for unknown / invalid)."""
+-    m = re.search(r"\{.*?\}", text, flags=re.S)
+-    if not m:
+-        return None
+-    try:
+-        obj = json.loads(m.group(0))
+-    except json.JSONDecodeError:
++    obj = None
++    dec = json.JSONDecoder()
++    for m in re.finditer(r"\{", text):               # first brace that starts a valid JSON object
++        try:
++            cand, _ = dec.raw_decode(text[m.start():])
++        except json.JSONDecodeError:
++            continue
++        if isinstance(cand, dict) and any(k in cand for k in S.SLOT_NAMES):   # skip unrelated JSON objects
++            obj = cand
++            break
++    if obj is None:
+         return None
+     out: Dict[str, Optional[int]] = {}
+     for name in S.SLOT_NAMES:
+@@ -96,10 +101,14 @@
+         text = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+         images, videos = process_vision_info(msgs)
+         inp = self.processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt").to(self.model.device)
+-        out = self.model.generate(**inp, do_sample=True, temperature=self.temperature, max_new_tokens=self.max_new_tokens,
+-                                  num_return_sequences=n)
+-        out = out[:, inp.input_ids.shape[1]:]
+-        return self.processor.batch_decode(out, skip_special_tokens=True)
++        # n independent sampled generations in a loop: num_return_sequences>1 with video inputs has
++        # been buggy in some transformers versions and returns near-duplicate captions.
++        texts = []
++        for _ in range(n):
++            out = self.model.generate(**inp, do_sample=True, temperature=self.temperature,
++                                      max_new_tokens=self.max_new_tokens)
++            texts += self.processor.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)
++        return texts
+ 
+ 
+ def run(backend, items: List[dict], n_samples: int = 3) -> List[dict]:
+diff -ruN -x __pycache__ orig/crvad_project/crvad/train.py new/crvad_project/crvad/train.py
+--- orig/crvad_project/crvad/train.py	2026-10-12 08:11:35.000000000 +0000
++++ new/crvad_project/crvad/train.py	2026-10-13 06:46:59.353400387 +0000
+@@ -74,7 +74,7 @@
+     scores = model.posterior_scores(seg, text_emb)
+     mil, _ = mil_loss(scores, b["video_label"], c["k_frac"])
+     loss, logs = mil, dict(mil=mil.item())
+-    valid = b["slots"][:, 0] >= 0
++    valid = (b["slots"] >= 0).all(dim=1)          # a -1 in ANY slot would wrap to a wrong hypothesis
+     if valid.any() and c["lam_nce"] > 0:
+         sl = b["slots"][valid]
+         pos = flat_index(sl)
+@@ -127,6 +127,10 @@
+     sched = torch.optim.lr_scheduler.LambdaLR(
+         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
+     use_amp = cfg["amp"] and dev.type == "cuda"
++    if use_amp and not torch.cuda.is_bf16_supported():
++        # T4 (Turing) has no bf16 and the heads are tiny: fp32 is simpler and safe.
++        print("[warn] bf16 unsupported on this GPU; running in fp32 (amp disabled)")
++        use_amp = False
+     out_dir = os.path.join(cfg["out"], f"stage{stage}")
+     os.makedirs(out_dir, exist_ok=True)
+     step_fn = loss_stage1 if stage == 1 else loss_stage2
+diff -ruN -x __pycache__ orig/crvad_project/tests/test_probes_v2.py new/crvad_project/tests/test_probes_v2.py
+--- orig/crvad_project/tests/test_probes_v2.py	1970-01-01 00:00:00.000000000 +0000
++++ new/crvad_project/tests/test_probes_v2.py	2026-10-13 06:47:47.981521538 +0000
+@@ -0,0 +1,133 @@
++"""Fast unit tests (no model weights, no network). Each test pins down a failure that produced a
++silently wrong number in the first Gate-2 run.   python tests/test_probes_v2.py
++"""
++import os, sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import torch
++
++from crvad.features import window_starts
++from crvad.losses import flat_index
++from crvad.probes.encoder_bakeoff import NORM, _prep, normalise, pool_frames
++from crvad.probes.metrics import bootstrap_macro_auc, macro_auc, pair_report, permutation_p
++from crvad.probes.relation_probe import cv_pair_auc, probe_macro, variants
++from crvad.pseudo_label import parse_response
++
++
++def test_normalise_does_not_clamp():
++    torch.manual_seed(0)
++    clips = (torch.rand(4, 8, 3, 64, 64) * 255).to(torch.uint8)       # uniform pixels
++    x = _prep(clips, "cpu")
++    assert 0 <= x.min() and x.max() <= 1
++    for name in ("clip", "xclip"):
++        z = normalise(x, name)
++        assert z.min() < -1.5 and z.max() > 1.5, f"{name}: range {z.min():.2f}..{z.max():.2f} looks clamped"
++        assert abs(z.mean()) < 0.3 and 0.8 < z.std() < 1.4
++    # the two checkpoints use different constants
++    assert not torch.allclose(normalise(x, "clip"), normalise(x, "xclip"))
++    assert NORM["clip"] != NORM["xclip"]
++
++
++def test_pool_is_mean_by_default_and_normalised():
++    Fr = torch.nn.functional.normalize(torch.randn(5, 16, 32), dim=-1)
++    p = pool_frames(Fr)
++    assert torch.allclose(p.norm(dim=-1), torch.ones(5), atol=1e-5)
++    assert torch.allclose(p, torch.nn.functional.normalize(Fr.mean(1), dim=-1), atol=1e-6)
++
++
++def test_window_starts_cover_the_tail():
++    assert window_starts(10, 32) == [0]
++    assert window_starts(32, 32) == [0]
++    assert window_starts(96, 32) == [0, 32, 64]
++    for n in (33, 70, 100, 257):
++        st = window_starts(n, 32)
++        assert st[0] == 0 and st[-1] + 32 == n, (n, st)      # last window ends exactly at the video end
++
++
++def test_parse_response():
++    ok = '{"action": "takes", "object": "bag", "scene": "store", "relation": "from a shelf"}'
++    assert parse_response("noise " + ok + " trailing")["action"] == 0
++    nested = '{"note": {"x": 1}, "action": "throws", "object": "box", "scene": "plaza", "relation": "toward a person"}'
++    assert parse_response(nested)["action"] == 3                  # v1's non-greedy regex truncated this
++    two = '{"junk": 1} ' + ok
++    assert parse_response(two)["action"] == 0                       # unrelated {"junk": 1} is skipped
++    assert parse_response("no json here") is None
++
++
++def test_negative_slot_is_rejected():
++    try:
++        flat_index(torch.tensor([[0, 0, 0, -1]]))
++    except ValueError:
++        return
++    raise AssertionError("flat_index accepted a -1 slot")
++
++
++def test_video_blind_classifier_is_not_rewarded():
++    """Always prefer caption A (s = large constant + noise): v1 pooled accuracy = n_A/(n_A+n_B)."""
++    g = torch.Generator().manual_seed(0)
++    sA, sB = 0.5 + 1e-3 * torch.randn(12, generator=g), 0.5 + 1e-3 * torch.randn(4, generator=g)
++    r = pair_report(sA, sB)
++    assert abs(r["acc_raw"] - 0.75) < 1e-9 and r["constant_preference"]
++    assert abs(r["acc_balanced"] - 0.5) < 1e-9
++    assert abs(r["auc"] - 0.5) < 0.25                            # chance-level, not 0.75
++    pairs = [{"ta": i, "tb": 100 + i, "sA": 0.5 + 1e-3 * torch.randn(12, generator=g),
++              "sB": 0.5 + 1e-3 * torch.randn(4, generator=g)} for i in range(15)]
++    assert 0.4 < macro_auc(pairs) < 0.6
++    assert permutation_p(pairs, 300) > 0.05
++
++
++def test_real_signal_is_detected():
++    g = torch.Generator().manual_seed(1)
++    pairs = [{"ta": i, "tb": 100 + i, "sA": 0.3 + 0.2 * torch.randn(10, generator=g),
++              "sB": -0.3 + 0.2 * torch.randn(10, generator=g)} for i in range(8)]
++    assert macro_auc(pairs) > 0.9
++    lo, hi = bootstrap_macro_auc(pairs, 300)
++    assert lo > 0.8 and permutation_p(pairs, 300) < 0.01
++
++
++def _order_pairs(signal_order=True, n=14, T=8, D=24, seed=0, scale=1.0, offset=0.0):
++    g = torch.Generator().manual_seed(seed)
++    u, v = torch.randn(D, generator=g), torch.randn(D, generator=g)
++    def clip(forward):
++        a, b = (u, v) if forward else (v, u)
++        t = torch.linspace(0, 1, T)[:, None]
++        return (1 - t) * a + t * b + 0.5 * torch.randn(T, D, generator=g)
++    A = torch.stack([clip(True) for _ in range(n)])
++    B = torch.stack([clip(signal_order) if not signal_order else clip(False) for _ in range(n)])
++    return A * scale + offset, B * scale + offset
++
++
++def test_order_only_pairs_need_order_aware_features():
++    A, B = _order_pairs(True)
++    vA, vB = variants(A), variants(B)
++    mean_auc = cv_pair_auc(vA["mean"], vB["mean"])
++    halves_auc = cv_pair_auc(vA["halves"], vB["halves"])
++    assert mean_auc < 0.7, mean_auc                              # order-blind cannot solve it
++    assert halves_auc > 0.9, halves_auc                          # order-aware can
++
++
++def test_probe_is_scale_and_offset_invariant():
++    """CLIP clip features have per-dim std ~0.009 and a huge common offset; v1 died on that."""
++    A, B = _order_pairs(True, seed=3)
++    base = cv_pair_auc(variants(A)["halves"], variants(B)["halves"])
++    tiny = cv_pair_auc(variants(A * 0.009 + 0.03)["halves"], variants(B * 0.009 + 0.03)["halves"])
++    assert abs(base - tiny) < 0.05 and tiny > 0.9
++
++
++def test_no_signal_gives_chance_and_calibrated_null():
++    g = torch.Generator().manual_seed(5)
++    pf = [{"A": torch.randn(10, 40, generator=g), "B": torch.randn(10, 40, generator=g)} for _ in range(6)]
++    r = probe_macro(pf, n_perm=60)
++    assert 0.35 < r["macro_auc"] < 0.65 and r["p_value"] > 0.05, r
++    assert abs(r["null_mean"] - 0.5) < 0.08
++
++
++if __name__ == "__main__":
++    fails = 0
++    for k, f in list(globals().items()):
++        if k.startswith("test_") and callable(f):
++            try:
++                f(); print("ok  ", k)
++            except Exception as e:
++                fails += 1; print("FAIL", k, "->", type(e).__name__, e)
++    sys.exit(1 if fails else 0)
+diff -ruN -x __pycache__ orig/crvad_project/tools/audit_gate2_json.py new/crvad_project/tools/audit_gate2_json.py
+--- orig/crvad_project/tools/audit_gate2_json.py	1970-01-01 00:00:00.000000000 +0000
++++ new/crvad_project/tools/audit_gate2_json.py	2026-10-13 06:49:03.197067807 +0000
+@@ -0,0 +1,33 @@
++"""Re-audit a v1-format Gate-2 bake-off JSON (runs/gate2_encoder_bakeoff.json).
++
++Flags what the v1 pooled accuracy cannot tell apart from a video-blind classifier:
++  * pairs whose #correct equals one template's clip count (constant caption preference),
++  * the range of pooled accuracy a constant-preference classifier can reach on these pair sizes,
++  * the bias-cancelled per-pair margin (mean, SE, sign count),
++  * a pair-level cluster bootstrap CI next to the (iid) one reported.
++
++    python tools/audit_gate2_json.py runs/gate2_encoder_bakeoff.json
++"""
++import json, random, sys
++
++path = sys.argv[1] if len(sys.argv) > 1 else "runs/gate2_encoder_bakeoff.json"
++for enc, r in json.load(open(path)).items():
++    pp = r["per_pair"]; Ns = [v["n_a"] + v["n_b"] for v in pp.values()]
++    ks = [round(v["edit_acc"] * N) for v, N in zip(pp.values(), Ns)]
++    tot = sum(Ns)
++    const = sum(k in (v["n_a"], v["n_b"]) for k, v in zip(ks, pp.values()))
++    best = sum(max(v["n_a"], v["n_b"]) for v in pp.values()) / tot
++    worst = sum(min(v["n_a"], v["n_b"]) for v in pp.values()) / tot
++    ms = [v["margin"] for v in pp.values()]
++    mu = sum(ms) / len(ms); sd = (sum((m - mu) ** 2 for m in ms) / (len(ms) - 1)) ** .5
++    random.seed(0); bs = []
++    for _ in range(5000):
++        idx = [random.randrange(len(Ns)) for _ in Ns]
++        bs.append(sum(ks[i] for i in idx) / sum(Ns[i] for i in idx))
++    bs.sort()
++    print(f"== {enc}: pooled acc {r['edit_acc']:.3f}, reported iid CI {r['edit_acc_ci95'][0]:.3f}-{r['edit_acc_ci95'][1]:.3f}")
++    print(f"   constant-preference signature: {const}/{len(pp)} pairs; a constant-preference classifier "
++          f"reaches {worst:.3f}..{best:.3f} on these pair sizes")
++    print(f"   bias-cancelled margin: mean {mu:+.5f}, SE {sd / len(ms) ** .5:.5f}, t {mu / (sd / len(ms) ** .5):+.2f}, "
++          f"positive in {sum(m > 0 for m in ms)}/{len(ms)} pairs")
++    print(f"   pair-cluster bootstrap 95% CI: [{bs[125]:.3f}, {bs[4875]:.3f}]")
