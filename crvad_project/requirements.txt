@@ -10,8 +10,12 @@ pyyaml
 # (ImportError: DLL load failed) -- torch's own DLLs load fine, so the block is
 # targeted rather than blanket. av decodes the AV1 video in the LeRobot mirror;
 # OpenCV cannot open it.
+#
+# av floor is 14, not 19: av 19 requires Python >=3.12, so pinning it there makes
+# the install unresolvable on a 3.11 interpreter. Pin to what the code needs, not to
+# the newest release.
 polars>=2.0.0
-av>=19.0.0
+av>=14.0.0
 
 # feature extraction / pseudo-labelling (GPU box only)
 transformers>=4.45
